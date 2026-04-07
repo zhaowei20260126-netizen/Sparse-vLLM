@@ -1,3 +1,5 @@
+![logo.png](assets/logo.png)
+
 ![sparse_vllm_throughput.png](assets/sparse_vllm_throughput.png)
 
 <p align="center">
