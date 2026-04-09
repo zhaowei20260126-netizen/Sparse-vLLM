@@ -1,2 +1,0 @@
-[console_scripts]
-deltakv-train = deltakv.train_compressor:main
