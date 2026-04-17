@@ -1,0 +1,47 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug bench_sparse_vllm",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/bench_sparse_vllm.py",
+      "args": [
+        "--model_path",
+        "${workspaceFolder}/models/Qwen2.5-0.5B-Instruct/",
+        "--lengths",
+        "1000",
+        "--batch_sizes",
+        "64",
+        "--methods",
+        "vanilla",
+        "--hyper_params",
+        "{\"gpu_memory_utilization\": 0.9}"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Debug bench_sparse_vllm (vanilla vs snapkv)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/bench_sparse_vllm.py",
+      "args": [
+        "--model_path",
+        "${workspaceFolder}/models/Qwen2.5-0.5B-Instruct/",
+        "--lengths",
+        "1000",
+        "--batch_sizes",
+        "64",
+        "--methods",
+        "vanilla,snapkv",
+        "--hyper_params",
+        "{\"gpu_memory_utilization\": 0.9}"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

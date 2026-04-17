@@ -10,11 +10,11 @@ from sparsevllm.utils.log import logger
 
 @dataclass
 class Config:
-    model: str
-    max_num_batched_tokens: int = 65536
-    max_num_seqs_in_batch: int = 32  # 不能设置太大
-    max_model_len: int = 128_000
-    max_decoding_seqs: int = 64
+    model: str 
+    max_num_batched_tokens: int = 65536 # 限制 token 总数，控制预填充的批次大小（batch size）和每个序列的长度（sequence length）的乘积，避免一次性处理过多 token 导致显存不足。
+    max_num_seqs_in_batch: int = 32  # 不能设置太大，限制序列个数
+    max_model_len: int = 128_000 # 单个序列的最大长度，超过这个长度的部分可能会被截断或者导致错误。
+    max_decoding_seqs: int = 64 # 限制 decode 队列的长度,正同时进行 decode 的序列最多 64 个
 
     chunk_prefill_size: int = 8192
     gpu_memory_utilization: float = 0.8

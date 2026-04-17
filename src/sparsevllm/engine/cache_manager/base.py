@@ -152,7 +152,7 @@ class CacheManager(ABC):
 
             return OmniKVCacheManager(config, rank, world_size)
 
-        from .standard import StandardCacheManager
+        from .standard import StandardCacheManager # 注意力计算时访问全部历史 token（因此叫 "vanilla"）
 
         return StandardCacheManager(config, rank, world_size)
 

@@ -130,46 +130,58 @@ class LLMEngine:
     """
 
     def __init__(self, model, **kwargs):
-        # 1. 初始化配置
+        """
+        初始化 LLMEngine，完成以下任务：
+        1. 加载配置和模型分词器
+        2. 启动多进程张量并行 (TP) 环境
+        3. 创建调度器和缓存管理器
+        4. 预热模型，确保所有算子就绪
+        """
+        # === 第1步：基础配置初始化 ===
+        # 从 Config dataclass 中过滤出有效参数，避免传入不识别的 kwargs
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         self.config = config
         
-        # 初始化 Profiler
+        # 启用/禁用性能分析器
         profiler.set_enabled(config.enable_profiler)
         
-        # 2. 启动多进程张量并行 (TP) 环境
-        self.ps = []
-        self.events = []
+        # === 第2步：启动多进程张量并行 (TP) 环境 ===
+        # Rank 0 在主进程运行，Rank 1..N-1 各启动独立的子进程
+        # 这样可以充分利用多 GPU 的计算能力
+        self.ps = []  # 子进程对象列表，用于最后的清理和等待
+        self.events = []  # 进程间同步事件，用于协调多进程启动
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
-            # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
+            # 为每个非零 Rank 启动独立的 ModelRunner 进程
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
         
-        # 3. 初始化主进程的 ModelRunner (Rank 0)
-        # 注意：必须先初始化 ModelRunner 以便在本地 GPU 分配 KV Cache 账本
+        # === 第3步：初始化 Rank 0 的 ModelRunner ===
+        # 必须先于 Scheduler 创建，以便在 GPU 上初始化 KV Cache 物理内存账本
         self.model_runner = ModelRunner(config, 0, self.events)
         
-        # 加载分词器
+        # === 第4步：加载分词器 ===
         self.tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         
-        # 4. 初始化调度器
-        # 关键设计：将 Rank 0 的 CacheManager 传给 Scheduler。
-        # Scheduler 通过它来感知全局显存的余量，从而做出调度和抢占决策。
+        # === 第5步：初始化调度器 ===
+        # 关键设计：将主进程的 CacheManager 传给 Scheduler
+        # Scheduler 通过 CacheManager 感知剩余显存，实现智能调度和抢占策略
         self.scheduler = Scheduler(config, self.model_runner.cache_manager)
         
+        # === 第6步：设置日志和资源清理 ===
         self._exited = False
         self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s)
-        # 注册退出钩子，确保程序崩溃或结束时能正确释放多进程资源
+        # 注册退出钩子，确保异常退出时仍能正确清理多进程资源
         atexit.register(self.exit)
 
-        # 5. 预热模型
+        # === 第7步：预热模型 ===
+        # 触发算子编译和内存分配，预热后系统可投入使用
         self._warmup()
         self._throughput_logger.start()
 
