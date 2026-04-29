@@ -15,7 +15,7 @@ from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.utils.profiler import profiler
 
-class _ThroughputIntervalLogger:
+class _ThroughputIntervalLogger: # 定时打印日志的守护线程
     def __init__(self, interval_s: float):
         self._interval_s = float(interval_s)
         self._lock = threading.Lock()
@@ -33,7 +33,7 @@ class _ThroughputIntervalLogger:
         self._last_batch = "idle"  # "pf-L", "pf-S", "dc-L", "dc-S", "idle"
         self._last_report_t = perf_counter()
 
-    def start(self):
+    def start(self): # 专门开一个后台线程，每隔固定的时间（比如 10-30 秒）醒来一次，计算并打印当前引擎的吞吐量（平均处理了多少 token）
         if self._interval_s <= 0:
             return
         if self._thread is not None:
@@ -79,7 +79,7 @@ class _ThroughputIntervalLogger:
             self._decode_short_seqs = int(decode_short_seqs)
             self._last_batch = str(last_batch)
 
-    def _run(self):
+    def _run(self): #  # 定时唤醒打印日志
         while not self._stop.wait(self._interval_s):
             now = perf_counter()
             with self._lock:
@@ -267,64 +267,65 @@ class LLMEngine:
 
     def step(self):
         """
-        执行单个推理步进（一个 Batch）。
-        包含：调度、抢占处理、模型前向计算、状态更新、资源回收。
+        执行引擎的单次推理迭代（心跳循环）。
+        每次调用都会挑出一批序列，让 GPU 执行前向计算（预填充提示词，或者生成一个新字），并自动管理显存分配。
+        
+        返回值：
+        - finished_outputs: 遇到终止符、已完成生成的序列结果 [(seq_id, token_ids), ...]
+        - num_tokens: 本次迭代处理的总 token 数（方便外部算吞吐量）
         """
         with profiler.record("step"):
-            # 1. 调度：决定哪些序列进入本次 Batch
+            
+            # --- 1. 队列调度 (Scheduling) ---
+            # 不混跑：要么全是 prefill，要么全是 decode
+            # 可能返回被抢占的序列 (显存不足时)
             with profiler.record("schedule"):
                 seqs, is_prefill, preempted_seqs = self.scheduler.schedule()
             
-            # 2. 显式处理抢占 (Eviction)：
-            # 如果有序列被调度器踢出，立即广播指令让所有 Rank 释放其占用的物理槽位
+            # --- 2. 抢占释放 (Preemption) ---
+            # 如果显存不够，调度器会牺牲掉部分序列 (preempted_seqs)。
+            # 跨进程释放被抢占序列的 KV Cache 物理 slot
             with profiler.record("preempt_free"):
                 for seq in preempted_seqs:
                     self.model_runner.call("free_slots", seq.seq_id)
                 
+            # --- 兜底检查：如果本轮无事可做 ---
+            # 如果什么序列都没拿到，正常情况是因为都跑完了，或者刚好在做大清理。
+            # 如果不是这俩原因，说明死锁卡住了，直接报错。
             if not seqs:
-                # No progress can be made; avoid infinite busy-looping in callers.
                 if preempted_seqs or self.is_finished():
+                    # 把排队状况上报给监控，然后本回合空跑结束
                     prefill_seqs = len(self.scheduler.waiting)
                     decode_seqs = len(self.scheduler.decoding)
                     prefill_threshold = self.scheduler._long_text_threshold(is_prefill=True)
                     decode_threshold = self.scheduler._long_text_threshold(is_prefill=False)
-                    prefill_long = sum(
-                        1 for s in self.scheduler.waiting if int(s.num_prompt_tokens) > int(prefill_threshold)
-                    )
-                    decode_long = sum(
-                        1 for s in self.scheduler.decoding if int(s.num_tokens) > int(decode_threshold)
-                    )
+                    prefill_long = sum(1 for s in self.scheduler.waiting if int(s.num_prompt_tokens) > int(prefill_threshold))
+                    decode_long = sum(1 for s in self.scheduler.decoding if int(s.num_tokens) > int(decode_threshold))
                     self._throughput_logger.record_state(
-                        prefill_seqs + decode_seqs,
-                        prefill_seqs,
-                        decode_seqs,
-                        prefill_long,
-                        prefill_seqs - prefill_long,
-                        decode_long,
-                        decode_seqs - decode_long,
-                        "idle",
+                        prefill_seqs + decode_seqs, prefill_seqs, decode_seqs,
+                        prefill_long, prefill_seqs - prefill_long, decode_long, decode_seqs - decode_long, "idle",
                     )
                     return [], 0
-                # Most commonly: a prompt is larger than KV cache capacity (for methods that keep all tokens),
-                # or scheduling constraints prevent any chunk from being placed.
+                
                 raise RuntimeError(
-                    "Scheduler returned no runnable sequences and no preemptions; "
-                    "this would hang the generation loop. "
-                    f"method={self.config.vllm_sparse_method} free_slots={self.model_runner.cache_manager.num_free_slots} "
-                    f"waiting={len(self.scheduler.waiting)} decoding={len(self.scheduler.decoding)}"
+                    f"死锁：调度器拿不到活儿，也没释放资源！方法={self.config.vllm_sparse_method} "
+                    f"空闲显存块={self.model_runner.cache_manager.num_free_slots}"
                 )
                 
-            # 3. 跨进程广播并执行推理：
-            # Rank 0 会驱动所有 Rank 进程同步运行本地的 ModelRunner.run
+            # --- 3. 模型执行 (Model Forward) ---
+            # 所有 Rank (含子进程) 同步执行模型前向 + 采样
             with profiler.record("model_run_call"):
                 token_ids, attn_score = self.model_runner.call("run", seqs, is_prefill)
             
-            # 4. 逻辑后处理：更新序列的 Token 列表和状态机
+            # --- 4. 后处理状态更新 (Postprocessing) ---
+            '''→ 更新序列状态：prefill 进度递增、decode token 追加
+            → 序列在 waiting/decoding 之间迁移
+            → 标记完成的序列'''
             with profiler.record("postprocess"):
                 self.scheduler.postprocess(seqs, token_ids, is_prefill)
             
-            # 5. 完成序列的资源回收：
-            # 遍历序列，如果已达到 EOS 或最大长度，则通知所有进程释放物理槽位
+            # --- 5. 清理完成序列 (Cleanup) ---
+            # 对于刚才判断已经全剧终的序列，马上通知显卡释放它们的显存区，让位给别的请求。
             with profiler.record("finished_free"):
                 finished_outputs = []
                 for seq in seqs:
@@ -332,32 +333,31 @@ class LLMEngine:
                         self.model_runner.call("free_slots", seq.seq_id)
                         finished_outputs.append((seq.seq_id, seq.completion_token_ids))
         
-        # 计算吞吐量统计数据 (正数表示 Prefill，负数表示 Decode)
+        # --- 6. 记账与性能上报 (Throughput Logging) ---
+        # 算一下刚刚这一回合干了多少活，喂给后台线程去打日志和画吞吐图。
         num_tokens = sum(seq.current_chunk_size for seq in seqs) if is_prefill else -len(seqs)
         self._throughput_logger.record_step(num_tokens)
+        
         prefill_seqs = len(self.scheduler.waiting)
         decode_seqs = len(self.scheduler.decoding)
         prefill_threshold = self.scheduler._long_text_threshold(is_prefill=True)
         decode_threshold = self.scheduler._long_text_threshold(is_prefill=False)
         prefill_long = sum(1 for s in self.scheduler.waiting if int(s.num_prompt_tokens) > int(prefill_threshold))
         decode_long = sum(1 for s in self.scheduler.decoding if int(s.num_tokens) > int(decode_threshold))
+        
         if is_prefill:
             batch_is_long = bool(int(seqs[0].num_prompt_tokens) > int(prefill_threshold))
             stage = "pf"
         else:
             batch_is_long = bool(int(seqs[0].num_tokens) > int(decode_threshold))
             stage = "dc"
-        last_batch = f"{stage}-{'L' if batch_is_long else 'S'}"
+            
         self._throughput_logger.record_state(
-            prefill_seqs + decode_seqs,
-            prefill_seqs,
-            decode_seqs,
-            prefill_long,
-            prefill_seqs - prefill_long,
-            decode_long,
-            decode_seqs - decode_long,
-            last_batch,
+            prefill_seqs + decode_seqs, prefill_seqs, decode_seqs, prefill_long,
+            prefill_seqs - prefill_long, decode_long, decode_seqs - decode_long,
+            f"{stage}-{'L' if batch_is_long else 'S'}",
         )
+        
         return finished_outputs, num_tokens
 
     def is_finished(self):

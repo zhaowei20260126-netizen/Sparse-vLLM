@@ -1,0 +1,1455 @@
+针对cache修改的代码：
+class OffloadedCache(DynamicCache):
+    """
+    A drop-in replacement for DynamicCache that conserves GPU memory at the expense of more CPU memory.
+    Useful for generating from models with very long context.
+
+    In addition to the default CUDA stream, where all forward() computations happen,
+    this class uses another stream, the prefetch stream, which it creates itself.
+    Since scheduling of operations on separate streams happens independently, this class uses
+    the prefetch stream to asynchronously prefetch the KV cache of layer k+1 when layer k is executing.
+    The movement of the layer k-1 cache to the CPU is handled by the default stream as a simple way to
+    ensure the eviction is scheduled after all computations on that cache are finished.
+    """
+
+    def __init__(self, topk=1024) -> None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("OffloadedCache can only be used with a GPU")
+        super().__init__()
+        
+        self.key_cache: List[torch.Tensor] = [] #CPU, 全部cache
+        self.value_cache: List[torch.Tensor] = []
+        self.key_buffer: List[torch.Tensor] = [] #GPU, 压缩后cache
+        self.value_buffer: List[torch.Tensor] = []
+        
+        ## 原始transformer的OffloadedCache初始化部分
+        self.original_device = []
+        self.prefetch_stream = []
+        self.beam_idx = None  # used to delay beam search operations
+        ##
+
+        self.seen_token_list=[0]*32
+
+        # for attention prediction
+        self.attn_history: List[torch.Tensor] = []
+        self.tsp_mask: List[torch.Tensor] = []
+        self.topk = topk
+        self.history_step = 64
+        self.pooling_block_size = 16
+        self.sink_token = 64
+        self.local_token = 64
+
+        self.model = CNN()
+        self.model.load_state_dict(torch.load('/home/qyyang/kvcache/LLM-AttentionPredictor/model/CNN_llama3.1_alltask_5case/best_model.pth', map_location='cuda:0', weights_only=False))
+        for param in self.model.parameters():
+            param.data = param.data.to(torch.float16)
+        self.model.to('cuda:0')
+        self.clock=[{} for _ in range(32)]
+        self.pooling = torch.nn.MaxPool1d(kernel_size=self.pooling_block_size, stride=self.pooling_block_size, padding=0, ceil_mode=True)
+        self.pooling = torch.jit.script(self.pooling).eval()
+
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=40)
+        self.futures = {}
+
+    def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
+        """
+        Support for backwards-compatible `past_key_value` indexing, e.g. `past_key_value[0][0].shape[2]` to get the
+        sequence length.
+        """
+        if layer_idx < len(self):
+            return (self.key_cache[layer_idx], self.value_cache[layer_idx])
+        else:
+            raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
+        
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
+        # TODO: deprecate this function in favor of `cache_position`
+        is_empty_layer = (
+            len(self.key_cache) == 0  # no cache in any layer
+            or len(self.key_cache) <= layer_idx  # skipped `layer_idx` and hasn't run a layer with cache after it
+            or len(self.key_cache[layer_idx]) == 0  # the layer has no cache
+        )
+        layer_seq_length = self.seen_token_list[layer_idx] if not is_empty_layer else 0
+        return layer_seq_length
+    
+    def seen_tokens(self):
+        # logger.warning_once(
+        #     "The `seen_tokens` attribute is deprecated and will be removed in v4.41. Use the `cache_position` "
+        #     "model input instead."
+        # )
+        if hasattr(self, "_seen_tokens"):
+            return self._seen_tokens
+        else:
+            return None
+
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Saves the beam indices and reorders the cache when the tensor is back to its device."""
+        # We delay this operation until the tensors are back to their original
+        # device because performing torch.index_select on the CPU is very slow
+        del self.beam_idx
+        self.beam_idx = beam_idx.clone()
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, cache_kwargs: Optional[Dict[str, Any]] = None,) -> Tuple[torch.Tensor]:
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[-2]
+        
+        # if layer_idx <5 and self.clock[layer_idx].get('update_start') is not None:
+        #     print(f"Layer {layer_idx}: per token Update time: {time.time()-self.clock[layer_idx]['update_start']}")
+        # self.clock[layer_idx]['update_start'] = time.time()
+        self.seen_token_list[layer_idx] += key_states.shape[-2]
+        # prefill stage
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+            self.original_device.append(key_states.device)
+            self.prefetch_stream.append(torch.cuda.Stream())
+            self.attn_history.append(None)
+            self.tsp_mask.append(None)
+            self.key_buffer.append(None)
+            self.value_buffer.append(None)
+            # if layer_idx <= 1:
+            # self.clock[layer_idx]['update_prefill_end'] = time.time()
+            # if layer_idx <5:
+            #     print(f"Layer {layer_idx}: Update prefill time: {self.clock[layer_idx]['update_prefill_end'] - self.clock[layer_idx]['update_start']}")
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        else: # decode stage
+            if layer_idx > -1:
+                # if layer_idx <5:
+                #     print(f"Layer {layer_idx}: Before synchronization, ready for syn")
+                self.prefetch_stream[layer_idx].synchronize()
+                _ = self.futures[layer_idx].result()
+                # print(f"Layer {layer_idx}: After synchronization, current stream is {torch.cuda.current_stream()}")
+                key_tensor, value_tensor = self.key_buffer[layer_idx], self.value_buffer[layer_idx]
+                self.key_buffer[layer_idx] = torch.cat([key_tensor, key_states], dim=-2)
+                self.value_buffer[layer_idx] = torch.cat([value_tensor, value_states], dim=-2)
+                # 更新cpu中的cache
+                key_states_cpu, value_states_cpu = key_states.to("cpu"), value_states.to("cpu")
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states_cpu], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states_cpu], dim=-2)
+                # self.clock[layer_idx]['update_decode_end'] = time.time()
+                # if layer_idx <5:
+                #     print(f"Layer {layer_idx}: Update decode time: {self.clock[layer_idx]['update_decode_end'] - self.clock[layer_idx]['update_start']}")
+            else: # 保持DynamicCache的行为
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+                return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        return self.key_buffer[layer_idx], self.value_buffer[layer_idx]
+    
+    def attention_predictor_gpu(self, attn: torch.Tensor, layer_idx: int) -> torch.Tensor:
+
+        future = self.executor.submit(self._attention_predictor_gpu, attn, layer_idx)
+        self.futures[layer_idx] = future
+
+    def _attention_predictor_gpu(self, attn: torch.Tensor, layer_idx: int) -> None:
+        
+        with torch.cuda.stream(self.prefetch_stream[layer_idx]):
+        # if True:
+            # self.clock[layer_idx]['attention_predictor_gpu_start'] = time.time()
+            # Prefetch next layer tensors to GPU
+            if attn.shape[-2] != 1: # prefilling
+                # offload kv_cache to CPU
+                self.offload_kv(layer_idx) # prefill layer2 0.38s
+            else: # decoding
+                attn = self.expand_attn(attn, layer_idx)
+            self.attn_history[layer_idx] = self.update_attn_history(self.attn_history[layer_idx], attn)
+            tsp_attn = self.time_sequence_predict(self.attn_history[layer_idx])
+            self.tsp_mask[layer_idx] = self.create_tsp_mask(self.attn_history[layer_idx][:,:,-1:,:], tsp_attn, topk=self.topk, layer_idx=layer_idx)
+            self.prefetch_stream[layer_idx].synchronize() # prefill 阶段等kv卸载完再加载
+            self.get_kv(self.tsp_mask[layer_idx], layer_idx)
+            # self.clock[layer_idx]['attention_predictor_gpu_end'] = time.time()
+            # if layer_idx <5:
+            #     print(f"Layer {layer_idx}: Attention predictor GPU time: {self.clock[layer_idx]['attention_predictor_gpu_end'] - self.clock[layer_idx]['attention_predictor_gpu_start']}")
+        #     print(f"Layer {layer_idx}: current stream is {torch.cuda.current_stream()}")
+        # print(f"Layer {layer_idx}: current stream is {torch.cuda.current_stream()}")
+        return
+    
+    def offload_kv(self, layer_idx: int):
+        # offload kv_cache to CPU
+        # print(f"Layer {layer_idx}: After synchronization, current stream is {torch.cuda.current_stream()}")
+        self.key_cache[layer_idx] = self.key_cache[layer_idx].to("cpu", non_blocking=True)
+        self.value_cache[layer_idx] = self.value_cache[layer_idx].to("cpu", non_blocking=True)
+        return
+     
+    def expand_attn(self, attn: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        # attn: [bs, head, 1, sparse_len+1]
+        # tsp_mask[layer_idx]: [bs, head, 1, seq_len]
+        # 生成一个[bs, head, 1, seq_len+1]形状的全零tensor，将attn的值填充到mask为0的位置和最后一个位置，返回
+        # 获取当前层的tsp_mask
+        tsp_mask = self.tsp_mask[layer_idx]
+        # 创建一个全零tensor，形状为[bs, head, 1, seq_len+1]
+        expanded_attn = torch.zeros(*tsp_mask.shape[:-1], tsp_mask.shape[-1], device=attn.device, dtype=attn.dtype)
+        # 获取需要保留的位置
+        sparse_indices = tsp_mask == 0
+        # 将attn的值填充到mask为0的位置和最后一个位置
+        expanded_attn.masked_scatter_(sparse_indices, attn[...,:-1])
+        expanded_attn = torch.cat([expanded_attn, attn[..., -1:]], dim=-1)
+        return expanded_attn
+
+    def get_kv(self, tsp_mask: torch.Tensor, layer_idx: int) -> Tuple[torch.Tensor]:
+        # tsp_mask: [bs, head, seq_len=1, token_idx]
+        # self.key_cache[layer_idx]: [bs, head, token_idx, hidden_dim=128]
+        # 根据mask位置，将key和value中的对应位置传输到gpu,存在key_buffer和value_buffer中
+        sparse_indices = tsp_mask.squeeze(-2) == 0
+        sparse_indices = sparse_indices.to(self.key_cache[layer_idx].device)
+        # 从key_cache中获取对应位置的key
+        key_sparse = self.key_cache[layer_idx][sparse_indices].view(tsp_mask.shape[0], tsp_mask.shape[1], -1, self.key_cache[layer_idx].shape[-1])
+        # 从value_cache中获取对应位置的value
+        value_sparse = self.value_cache[layer_idx][sparse_indices].view(tsp_mask.shape[0], tsp_mask.shape[1], -1, self.value_cache[layer_idx].shape[-1])
+        # 将key和value传输到GPU
+        device = self.original_device[layer_idx]
+        key_sparse = key_sparse.to(device)
+        value_sparse = value_sparse.to(device)
+        # 存储到keybuffer和valuebuffer中
+        self.key_buffer[layer_idx] = key_sparse.detach().clone()
+        self.value_buffer[layer_idx] = value_sparse.detach().clone()
+        return
+
+    def update_attn_history(self, attn_history, attn_weights_full):
+        attn_pooling = self.max_pooling(attn_weights_full, self.pooling_block_size)
+        if attn_history is None:
+            attn_history = attn_pooling[:, :, -self.history_step:]
+        else:
+            # attn_history: [bsz, head_num, 64, attn_len]
+            if attn_pooling.shape[-1] == attn_history.shape[-1]:
+                # 向上滚动一行，然后把新的一行放到最后
+                attn_history = torch.roll(attn_history, shifts=-1, dims=-2)
+                attn_history[:, :, -1:] = attn_pooling
+            else:
+                # 最后一列补零，先新建一个tensor，把原来的复制进去
+                new_shape = list(attn_history.shape)
+                new_shape[-1] += 1
+                new_attn_history = torch.zeros(new_shape, device=attn_history.device, dtype=attn_history.dtype)
+                new_attn_history[...,:-1, :-1] = attn_history[:, :, 1:]
+                attn_history = new_attn_history
+                attn_history[:, :, -1:] = attn_pooling
+        return attn_history
+    
+    def max_pooling(self, tensor, block_size):
+        # padding_size = (block_size - tensor.shape[-1] % block_size) % block_size
+        # padded_tensor = torch.cat([tensor, torch.zeros(tensor.shape[:-1] + (padding_size,), dtype=tensor.dtype, device=tensor.device)],dim=-1)
+        # pooled_tensor = padded_tensor.view(*padded_tensor.shape[:-1], -1, block_size).max(dim=-1)[0]
+        orig_shape = tensor.shape
+        tensor = tensor.reshape(-1, 1, tensor.shape[-1]) # [*, 1, L]
+        pooled = self.pooling(tensor)
+        # 恢复原来shape
+        new_shape = orig_shape[:-1] + (pooled.shape[-1],)
+        pooled = pooled.reshape(new_shape)
+        return pooled
+    
+    def time_sequence_predict(self, attn_history):
+        # attn_history = [bsz, head_num, 64, attn_len]
+        bsz, head_num, num_rows, attn_len = attn_history.shape
+        start = self.sink_token//self.pooling_block_size
+        end = attn_len-(self.local_token//self.pooling_block_size)
+        attn_history = attn_history[:, :, :, start:end]
+        attn_len = attn_history.shape[-1]
+
+        if end-start < 3: # CNN kernel is 3*3 size
+            tsp_attn = torch.ones(bsz, head_num, 1, attn_len).to(attn_history.device)
+            return tsp_attn
+        
+        with torch.no_grad():
+            inputs = attn_history.view(bsz * head_num, num_rows, attn_len) # 多个head同时预测
+            tsp_attn = self.model(inputs)
+        tsp_attn = tsp_attn.view(bsz, head_num, 1, attn_len)
+        return tsp_attn
+    
+    def create_tsp_mask(self, attn_weights, tsp_attn, topk=5, layer_idx=2):
+        # 修改：生成的mask值，mask掉的地方取-10000，topk和不足部分取0
+        # 创建和attn_weights相同形状的tsp_mask
+        # 此时得到的是上一步且压缩后attn大小，需要加一得到预测的mask大小
+        new_size = list(attn_weights.shape)
+        new_size[-1] = self.seen_token_list[layer_idx]
+        tsp_mask = torch.full(new_size, -10000.0, device=attn_weights.device).to(attn_weights.dtype)  # 初始化为 -10000
+
+        # 取tsp_attn的topk位置为1，生成mask,假设位置0
+        # print('tsp_attn:', tsp_attn.shape)
+        # print('attn_weights:', attn_weights.shape)
+        # print(topk, self.pooling_block_size)
+        # print(topk//self.pooling_block_size,tsp_attn.shape[-1])
+        if tsp_attn.shape[-1]<1:
+            tsp_mask[:, :, :, :self.sink_token] = 0
+            tsp_mask[:, :, :, -self.local_token:] = 0
+            return tsp_mask
+
+        _, topk_indices = torch.topk(tsp_attn, min((topk-self.sink_token-self.local_token)//self.pooling_block_size,tsp_attn.shape[-1]), dim=-1)
+        # print('topk_indices:', topk_indices.shape)
+        # 将形状从 [batch_size, topk] 扩展为 [batch_size, topk * self.pooling_block_size]，每个位置都扩展
+        # topk_indices = topk_indices.unsqueeze(-1) * self.pooling_block_size + torch.arange(self.pooling_block_size).to(topk_indices.device)
+        # topk_indices = topk_indices.view(*topk_indices.shape[:-2], -1)
+        # print('topk_indices:', topk_indices.shape)
+
+        # 将topk的位置设置为0，表示这些位置不被mask掉，假设位置0+sink，15+sink
+        tsp_mask.scatter_(-1, topk_indices + self.sink_token, 0)
+        # print('tsp_mask:', torch.sum(tsp_mask[0,0,0]==0))
+        overlap = (self.pooling_block_size - self._seen_tokens % self.pooling_block_size) % self.pooling_block_size
+        # 将tsp_mask的前sink个位置设置为0，表示这些位置不被mask掉
+        tsp_mask[:, :, :, :self.sink_token] = 0
+        # 最后local个位置不mask，local会和tsp生成的mask有所重合，但没事。
+        tsp_mask[:, :, :, -(self.local_token-overlap):] = 0
+        # 返回所有mask中=0的位置
+
+        return tsp_mask
+    
+    def update_old(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
+        Parameters:
+            key_states (`torch.Tensor`):
+                The new key states to cache.
+            value_states (`torch.Tensor`):
+                The new value states to cache.
+            layer_idx (`int`):
+                The index of the layer to cache the states for.
+            cache_kwargs (`Dict[str, Any]`, `optional`):
+                Additional arguments for the cache subclass. No additional arguments are used in `OffloadedCache`.
+        Return:
+            A tuple containing the updated key and value states.
+        """
+        # Update the number of seen tokens
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[-2]
+
+        # Update the cache
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+            self.original_device.append(key_states.device)
+            self.evict_previous_layer(layer_idx)
+        else:
+            key_tensor, value_tensor = self[layer_idx]
+            self.key_cache[layer_idx] = torch.cat([key_tensor, key_states], dim=-2)
+            self.value_cache[layer_idx] = torch.cat([value_tensor, value_states], dim=-2)
+
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    # According to https://docs.python.org/3/library/exceptions.html#NotImplementedError
+    # if a method is not supposed to be supported in a subclass we should set it to None
+    from_legacy_cache = None
+
+    to_legacy_cache = None
+class OffloadedCache(DynamicCache):
+    """
+    A drop-in replacement for DynamicCache that conserves GPU memory at the expense of more CPU memory.
+    Useful for generating from models with very long context.
+
+    In addition to the default CUDA stream, where all forward() computations happen,
+    this class uses another stream, the prefetch stream, which it creates itself.
+    Since scheduling of operations on separate streams happens independently, this class uses
+    the prefetch stream to asynchronously prefetch the KV cache of layer k+1 when layer k is executing.
+    The movement of the layer k-1 cache to the CPU is handled by the default stream as a simple way to
+    ensure the eviction is scheduled after all computations on that cache are finished.
+    """
+
+    def __init__(self, topk=1024) -> None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("OffloadedCache can only be used with a GPU")
+        super().__init__()
+        
+        self.key_cache: List[torch.Tensor] = [] #CPU, 全部cache
+        self.value_cache: List[torch.Tensor] = []
+        self.key_buffer: List[torch.Tensor] = [] #GPU, 压缩后cache
+        self.value_buffer: List[torch.Tensor] = []
+        
+        ## 原始transformer的OffloadedCache初始化部分
+        self.original_device = []
+        self.prefetch_stream = []
+        self.beam_idx = None  # used to delay beam search operations
+        ##
+
+        self.seen_token_list=[0]*32
+
+        # for attention prediction
+        self.attn_history: List[torch.Tensor] = []
+        self.tsp_mask: List[torch.Tensor] = []
+        self.topk = topk
+        self.history_step = 64
+        self.pooling_block_size = 16
+        self.sink_token = 64
+        self.local_token = 64
+
+        self.model = CNN()
+        self.model.load_state_dict(torch.load('/home/qyyang/kvcache/LLM-AttentionPredictor/model/CNN_llama3.1_alltask_5case/best_model.pth', map_location='cuda:0', weights_only=False))
+        for param in self.model.parameters():
+            param.data = param.data.to(torch.float16)
+        self.model.to('cuda:0')
+        self.clock=[{} for _ in range(32)]
+        self.pooling = torch.nn.MaxPool1d(kernel_size=self.pooling_block_size, stride=self.pooling_block_size, padding=0, ceil_mode=True)
+        self.pooling = torch.jit.script(self.pooling).eval()
+
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=40)
+        self.futures = {}
+
+    def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
+        """
+        Support for backwards-compatible `past_key_value` indexing, e.g. `past_key_value[0][0].shape[2]` to get the
+        sequence length.
+        """
+        if layer_idx < len(self):
+            return (self.key_cache[layer_idx], self.value_cache[layer_idx])
+        else:
+            raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
+        
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
+        # TODO: deprecate this function in favor of `cache_position`
+        is_empty_layer = (
+            len(self.key_cache) == 0  # no cache in any layer
+            or len(self.key_cache) <= layer_idx  # skipped `layer_idx` and hasn't run a layer with cache after it
+            or len(self.key_cache[layer_idx]) == 0  # the layer has no cache
+        )
+        layer_seq_length = self.seen_token_list[layer_idx] if not is_empty_layer else 0
+        return layer_seq_length
+    
+    def seen_tokens(self):
+        # logger.warning_once(
+        #     "The `seen_tokens` attribute is deprecated and will be removed in v4.41. Use the `cache_position` "
+        #     "model input instead."
+        # )
+        if hasattr(self, "_seen_tokens"):
+            return self._seen_tokens
+        else:
+            return None
+
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Saves the beam indices and reorders the cache when the tensor is back to its device."""
+        # We delay this operation until the tensors are back to their original
+        # device because performing torch.index_select on the CPU is very slow
+        del self.beam_idx
+        self.beam_idx = beam_idx.clone()
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, cache_kwargs: Optional[Dict[str, Any]] = None,) -> Tuple[torch.Tensor]:
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[-2]
+        
+        # if layer_idx <5 and self.clock[layer_idx].get('update_start') is not None:
+        #     print(f"Layer {layer_idx}: per token Update time: {time.time()-self.clock[layer_idx]['update_start']}")
+        # self.clock[layer_idx]['update_start'] = time.time()
+        self.seen_token_list[layer_idx] += key_states.shape[-2]
+        # prefill stage
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+            self.original_device.append(key_states.device)
+            self.prefetch_stream.append(torch.cuda.Stream())
+            self.attn_history.append(None)
+            self.tsp_mask.append(None)
+            self.key_buffer.append(None)
+            self.value_buffer.append(None)
+            # if layer_idx <= 1:
+            # self.clock[layer_idx]['update_prefill_end'] = time.time()
+            # if layer_idx <5:
+            #     print(f"Layer {layer_idx}: Update prefill time: {self.clock[layer_idx]['update_prefill_end'] - self.clock[layer_idx]['update_start']}")
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        else: # decode stage
+            if layer_idx > -1:
+                # if layer_idx <5:
+                #     print(f"Layer {layer_idx}: Before synchronization, ready for syn")
+                self.prefetch_stream[layer_idx].synchronize()
+                _ = self.futures[layer_idx].result()
+                # print(f"Layer {layer_idx}: After synchronization, current stream is {torch.cuda.current_stream()}")
+                key_tensor, value_tensor = self.key_buffer[layer_idx], self.value_buffer[layer_idx]
+                self.key_buffer[layer_idx] = torch.cat([key_tensor, key_states], dim=-2)
+                self.value_buffer[layer_idx] = torch.cat([value_tensor, value_states], dim=-2)
+                # 更新cpu中的cache
+                key_states_cpu, value_states_cpu = key_states.to("cpu"), value_states.to("cpu")
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states_cpu], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states_cpu], dim=-2)
+                # self.clock[layer_idx]['update_decode_end'] = time.time()
+                # if layer_idx <5:
+                #     print(f"Layer {layer_idx}: Update decode time: {self.clock[layer_idx]['update_decode_end'] - self.clock[layer_idx]['update_start']}")
+            else: # 保持DynamicCache的行为
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+                return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        return self.key_buffer[layer_idx], self.value_buffer[layer_idx]
+    
+    def attention_predictor_gpu(self, attn: torch.Tensor, layer_idx: int) -> torch.Tensor:
+
+        future = self.executor.submit(self._attention_predictor_gpu, attn, layer_idx)
+        self.futures[layer_idx] = future
+
+    def _attention_predictor_gpu(self, attn: torch.Tensor, layer_idx: int) -> None:
+        
+        with torch.cuda.stream(self.prefetch_stream[layer_idx]):
+        # if True:
+            # self.clock[layer_idx]['attention_predictor_gpu_start'] = time.time()
+            # Prefetch next layer tensors to GPU
+            if attn.shape[-2] != 1: # prefilling
+                # offload kv_cache to CPU
+                self.offload_kv(layer_idx) # prefill layer2 0.38s
+            else: # decoding
+                attn = self.expand_attn(attn, layer_idx)
+            self.attn_history[layer_idx] = self.update_attn_history(self.attn_history[layer_idx], attn)
+            tsp_attn = self.time_sequence_predict(self.attn_history[layer_idx])
+            self.tsp_mask[layer_idx] = self.create_tsp_mask(self.attn_history[layer_idx][:,:,-1:,:], tsp_attn, topk=self.topk, layer_idx=layer_idx)
+            self.prefetch_stream[layer_idx].synchronize() # prefill 阶段等kv卸载完再加载
+            self.get_kv(self.tsp_mask[layer_idx], layer_idx)
+            # self.clock[layer_idx]['attention_predictor_gpu_end'] = time.time()
+            # if layer_idx <5:
+            #     print(f"Layer {layer_idx}: Attention predictor GPU time: {self.clock[layer_idx]['attention_predictor_gpu_end'] - self.clock[layer_idx]['attention_predictor_gpu_start']}")
+        #     print(f"Layer {layer_idx}: current stream is {torch.cuda.current_stream()}")
+        # print(f"Layer {layer_idx}: current stream is {torch.cuda.current_stream()}")
+        return
+    
+    def offload_kv(self, layer_idx: int):
+        # offload kv_cache to CPU
+        # print(f"Layer {layer_idx}: After synchronization, current stream is {torch.cuda.current_stream()}")
+        self.key_cache[layer_idx] = self.key_cache[layer_idx].to("cpu", non_blocking=True)
+        self.value_cache[layer_idx] = self.value_cache[layer_idx].to("cpu", non_blocking=True)
+        return
+     
+    def expand_attn(self, attn: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        # attn: [bs, head, 1, sparse_len+1]
+        # tsp_mask[layer_idx]: [bs, head, 1, seq_len]
+        # 生成一个[bs, head, 1, seq_len+1]形状的全零tensor，将attn的值填充到mask为0的位置和最后一个位置，返回
+        # 获取当前层的tsp_mask
+        tsp_mask = self.tsp_mask[layer_idx]
+        # 创建一个全零tensor，形状为[bs, head, 1, seq_len+1]
+        expanded_attn = torch.zeros(*tsp_mask.shape[:-1], tsp_mask.shape[-1], device=attn.device, dtype=attn.dtype)
+        # 获取需要保留的位置
+        sparse_indices = tsp_mask == 0
+        # 将attn的值填充到mask为0的位置和最后一个位置
+        expanded_attn.masked_scatter_(sparse_indices, attn[...,:-1])
+        expanded_attn = torch.cat([expanded_attn, attn[..., -1:]], dim=-1)
+        return expanded_attn
+
+    def get_kv(self, tsp_mask: torch.Tensor, layer_idx: int) -> Tuple[torch.Tensor]:
+        # tsp_mask: [bs, head, seq_len=1, token_idx]
+        # self.key_cache[layer_idx]: [bs, head, token_idx, hidden_dim=128]
+        # 根据mask位置，将key和value中的对应位置传输到gpu,存在key_buffer和value_buffer中
+        sparse_indices = tsp_mask.squeeze(-2) == 0
+        sparse_indices = sparse_indices.to(self.key_cache[layer_idx].device)
+        # 从key_cache中获取对应位置的key
+        key_sparse = self.key_cache[layer_idx][sparse_indices].view(tsp_mask.shape[0], tsp_mask.shape[1], -1, self.key_cache[layer_idx].shape[-1])
+        # 从value_cache中获取对应位置的value
+        value_sparse = self.value_cache[layer_idx][sparse_indices].view(tsp_mask.shape[0], tsp_mask.shape[1], -1, self.value_cache[layer_idx].shape[-1])
+        # 将key和value传输到GPU
+        device = self.original_device[layer_idx]
+        key_sparse = key_sparse.to(device)
+        value_sparse = value_sparse.to(device)
+        # 存储到keybuffer和valuebuffer中
+        self.key_buffer[layer_idx] = key_sparse.detach().clone()
+        self.value_buffer[layer_idx] = value_sparse.detach().clone()
+        return
+
+    def update_attn_history(self, attn_history, attn_weights_full):
+        attn_pooling = self.max_pooling(attn_weights_full, self.pooling_block_size)
+        if attn_history is None:
+            attn_history = attn_pooling[:, :, -self.history_step:]
+        else:
+            # attn_history: [bsz, head_num, 64, attn_len]
+            if attn_pooling.shape[-1] == attn_history.shape[-1]:
+                # 向上滚动一行，然后把新的一行放到最后
+                attn_history = torch.roll(attn_history, shifts=-1, dims=-2)
+                attn_history[:, :, -1:] = attn_pooling
+            else:
+                # 最后一列补零，先新建一个tensor，把原来的复制进去
+                new_shape = list(attn_history.shape)
+                new_shape[-1] += 1
+                new_attn_history = torch.zeros(new_shape, device=attn_history.device, dtype=attn_history.dtype)
+                new_attn_history[...,:-1, :-1] = attn_history[:, :, 1:]
+                attn_history = new_attn_history
+                attn_history[:, :, -1:] = attn_pooling
+        return attn_history
+    
+    def max_pooling(self, tensor, block_size):
+        # padding_size = (block_size - tensor.shape[-1] % block_size) % block_size
+        # padded_tensor = torch.cat([tensor, torch.zeros(tensor.shape[:-1] + (padding_size,), dtype=tensor.dtype, device=tensor.device)],dim=-1)
+        # pooled_tensor = padded_tensor.view(*padded_tensor.shape[:-1], -1, block_size).max(dim=-1)[0]
+        orig_shape = tensor.shape
+        tensor = tensor.reshape(-1, 1, tensor.shape[-1]) # [*, 1, L]
+        pooled = self.pooling(tensor)
+        # 恢复原来shape
+        new_shape = orig_shape[:-1] + (pooled.shape[-1],)
+        pooled = pooled.reshape(new_shape)
+        return pooled
+    
+    def time_sequence_predict(self, attn_history):
+        # attn_history = [bsz, head_num, 64, attn_len]
+        bsz, head_num, num_rows, attn_len = attn_history.shape
+        start = self.sink_token//self.pooling_block_size
+        end = attn_len-(self.local_token//self.pooling_block_size)
+        attn_history = attn_history[:, :, :, start:end]
+        attn_len = attn_history.shape[-1]
+
+        if end-start < 3: # CNN kernel is 3*3 size
+            tsp_attn = torch.ones(bsz, head_num, 1, attn_len).to(attn_history.device)
+            return tsp_attn
+        
+        with torch.no_grad():
+            inputs = attn_history.view(bsz * head_num, num_rows, attn_len) # 多个head同时预测
+            tsp_attn = self.model(inputs)
+        tsp_attn = tsp_attn.view(bsz, head_num, 1, attn_len)
+        return tsp_attn
+    
+    def create_tsp_mask(self, attn_weights, tsp_attn, topk=5, layer_idx=2):
+        # 修改：生成的mask值，mask掉的地方取-10000，topk和不足部分取0
+        # 创建和attn_weights相同形状的tsp_mask
+        # 此时得到的是上一步且压缩后attn大小，需要加一得到预测的mask大小
+        new_size = list(attn_weights.shape)
+        new_size[-1] = self.seen_token_list[layer_idx]
+        tsp_mask = torch.full(new_size, -10000.0, device=attn_weights.device).to(attn_weights.dtype)  # 初始化为 -10000
+
+        # 取tsp_attn的topk位置为1，生成mask,假设位置0
+        # print('tsp_attn:', tsp_attn.shape)
+        # print('attn_weights:', attn_weights.shape)
+        # print(topk, self.pooling_block_size)
+        # print(topk//self.pooling_block_size,tsp_attn.shape[-1])
+        if tsp_attn.shape[-1]<1:
+            tsp_mask[:, :, :, :self.sink_token] = 0
+            tsp_mask[:, :, :, -self.local_token:] = 0
+            return tsp_mask
+
+        _, topk_indices = torch.topk(tsp_attn, min((topk-self.sink_token-self.local_token)//self.pooling_block_size,tsp_attn.shape[-1]), dim=-1)
+        # print('topk_indices:', topk_indices.shape)
+        # 将形状从 [batch_size, topk] 扩展为 [batch_size, topk * self.pooling_block_size]，每个位置都扩展
+        # topk_indices = topk_indices.unsqueeze(-1) * self.pooling_block_size + torch.arange(self.pooling_block_size).to(topk_indices.device)
+        # topk_indices = topk_indices.view(*topk_indices.shape[:-2], -1)
+        # print('topk_indices:', topk_indices.shape)
+
+        # 将topk的位置设置为0，表示这些位置不被mask掉，假设位置0+sink，15+sink
+        tsp_mask.scatter_(-1, topk_indices + self.sink_token, 0)
+        # print('tsp_mask:', torch.sum(tsp_mask[0,0,0]==0))
+        overlap = (self.pooling_block_size - self._seen_tokens % self.pooling_block_size) % self.pooling_block_size
+        # 将tsp_mask的前sink个位置设置为0，表示这些位置不被mask掉
+        tsp_mask[:, :, :, :self.sink_token] = 0
+        # 最后local个位置不mask，local会和tsp生成的mask有所重合，但没事。
+        tsp_mask[:, :, :, -(self.local_token-overlap):] = 0
+        # 返回所有mask中=0的位置
+
+        return tsp_mask
+    
+    def update_old(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
+        Parameters:
+            key_states (`torch.Tensor`):
+                The new key states to cache.
+            value_states (`torch.Tensor`):
+                The new value states to cache.
+            layer_idx (`int`):
+                The index of the layer to cache the states for.
+            cache_kwargs (`Dict[str, Any]`, `optional`):
+                Additional arguments for the cache subclass. No additional arguments are used in `OffloadedCache`.
+        Return:
+            A tuple containing the updated key and value states.
+        """
+        # Update the number of seen tokens
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[-2]
+
+        # Update the cache
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+            self.original_device.append(key_states.device)
+            self.evict_previous_layer(layer_idx)
+        else:
+            key_tensor, value_tensor = self[layer_idx]
+            self.key_cache[layer_idx] = torch.cat([key_tensor, key_states], dim=-2)
+            self.value_cache[layer_idx] = torch.cat([value_tensor, value_states], dim=-2)
+
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    # According to https://docs.python.org/3/library/exceptions.html#NotImplementedError
+    # if a method is not supposed to be supported in a subclass we should set it to None
+    from_legacy_cache = None
+
+    to_legacy_cache = None
+class OffloadedCache(DynamicCache):
+    """
+    A drop-in replacement for DynamicCache that conserves GPU memory at the expense of more CPU memory.
+    Useful for generating from models with very long context.
+
+    In addition to the default CUDA stream, where all forward() computations happen,
+    this class uses another stream, the prefetch stream, which it creates itself.
+    Since scheduling of operations on separate streams happens independently, this class uses
+    the prefetch stream to asynchronously prefetch the KV cache of layer k+1 when layer k is executing.
+    The movement of the layer k-1 cache to the CPU is handled by the default stream as a simple way to
+    ensure the eviction is scheduled after all computations on that cache are finished.
+    """
+
+    def __init__(self, topk=1024) -> None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("OffloadedCache can only be used with a GPU")
+        super().__init__()
+        
+        self.key_cache: List[torch.Tensor] = [] #CPU, 全部cache
+        self.value_cache: List[torch.Tensor] = []
+        self.key_buffer: List[torch.Tensor] = [] #GPU, 压缩后cache
+        self.value_buffer: List[torch.Tensor] = []
+        
+        ## 原始transformer的OffloadedCache初始化部分
+        self.original_device = []
+        self.prefetch_stream = []
+        self.beam_idx = None  # used to delay beam search operations
+        ##
+
+        self.seen_token_list=[0]*32
+
+        # for attention prediction
+        self.attn_history: List[torch.Tensor] = []
+        self.tsp_mask: List[torch.Tensor] = []
+        self.topk = topk
+        self.history_step = 64
+        self.pooling_block_size = 16
+        self.sink_token = 64
+        self.local_token = 64
+
+        self.model = CNN()
+        self.model.load_state_dict(torch.load('/home/qyyang/kvcache/LLM-AttentionPredictor/model/CNN_llama3.1_alltask_5case/best_model.pth', map_location='cuda:0', weights_only=False))
+        for param in self.model.parameters():
+            param.data = param.data.to(torch.float16)
+        self.model.to('cuda:0')
+        self.clock=[{} for _ in range(32)]
+        self.pooling = torch.nn.MaxPool1d(kernel_size=self.pooling_block_size, stride=self.pooling_block_size, padding=0, ceil_mode=True)
+        self.pooling = torch.jit.script(self.pooling).eval()
+
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=40)
+        self.futures = {}
+
+    def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
+        """
+        Support for backwards-compatible `past_key_value` indexing, e.g. `past_key_value[0][0].shape[2]` to get the
+        sequence length.
+        """
+        if layer_idx < len(self):
+            return (self.key_cache[layer_idx], self.value_cache[layer_idx])
+        else:
+            raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
+        
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
+        # TODO: deprecate this function in favor of `cache_position`
+        is_empty_layer = (
+            len(self.key_cache) == 0  # no cache in any layer
+            or len(self.key_cache) <= layer_idx  # skipped `layer_idx` and hasn't run a layer with cache after it
+            or len(self.key_cache[layer_idx]) == 0  # the layer has no cache
+        )
+        layer_seq_length = self.seen_token_list[layer_idx] if not is_empty_layer else 0
+        return layer_seq_length
+    
+    def seen_tokens(self):
+        # logger.warning_once(
+        #     "The `seen_tokens` attribute is deprecated and will be removed in v4.41. Use the `cache_position` "
+        #     "model input instead."
+        # )
+        if hasattr(self, "_seen_tokens"):
+            return self._seen_tokens
+        else:
+            return None
+
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Saves the beam indices and reorders the cache when the tensor is back to its device."""
+        # We delay this operation until the tensors are back to their original
+        # device because performing torch.index_select on the CPU is very slow
+        del self.beam_idx
+        self.beam_idx = beam_idx.clone()
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, cache_kwargs: Optional[Dict[str, Any]] = None,) -> Tuple[torch.Tensor]:
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[-2]
+        
+        # if layer_idx <5 and self.clock[layer_idx].get('update_start') is not None:
+        #     print(f"Layer {layer_idx}: per token Update time: {time.time()-self.clock[layer_idx]['update_start']}")
+        # self.clock[layer_idx]['update_start'] = time.time()
+        self.seen_token_list[layer_idx] += key_states.shape[-2]
+        # prefill stage
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+            self.original_device.append(key_states.device)
+            self.prefetch_stream.append(torch.cuda.Stream())
+            self.attn_history.append(None)
+            self.tsp_mask.append(None)
+            self.key_buffer.append(None)
+            self.value_buffer.append(None)
+            # if layer_idx <= 1:
+            # self.clock[layer_idx]['update_prefill_end'] = time.time()
+            # if layer_idx <5:
+            #     print(f"Layer {layer_idx}: Update prefill time: {self.clock[layer_idx]['update_prefill_end'] - self.clock[layer_idx]['update_start']}")
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        else: # decode stage
+            if layer_idx > -1:
+                # if layer_idx <5:
+                #     print(f"Layer {layer_idx}: Before synchronization, ready for syn")
+                self.prefetch_stream[layer_idx].synchronize()
+                _ = self.futures[layer_idx].result()
+                # print(f"Layer {layer_idx}: After synchronization, current stream is {torch.cuda.current_stream()}")
+                key_tensor, value_tensor = self.key_buffer[layer_idx], self.value_buffer[layer_idx]
+                self.key_buffer[layer_idx] = torch.cat([key_tensor, key_states], dim=-2)
+                self.value_buffer[layer_idx] = torch.cat([value_tensor, value_states], dim=-2)
+                # 更新cpu中的cache
+                key_states_cpu, value_states_cpu = key_states.to("cpu"), value_states.to("cpu")
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states_cpu], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states_cpu], dim=-2)
+                # self.clock[layer_idx]['update_decode_end'] = time.time()
+                # if layer_idx <5:
+                #     print(f"Layer {layer_idx}: Update decode time: {self.clock[layer_idx]['update_decode_end'] - self.clock[layer_idx]['update_start']}")
+            else: # 保持DynamicCache的行为
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+                return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        return self.key_buffer[layer_idx], self.value_buffer[layer_idx]
+    
+    def attention_predictor_gpu(self, attn: torch.Tensor, layer_idx: int) -> torch.Tensor:
+
+        future = self.executor.submit(self._attention_predictor_gpu, attn, layer_idx)
+        self.futures[layer_idx] = future
+
+    def _attention_predictor_gpu(self, attn: torch.Tensor, layer_idx: int) -> None:
+        
+        with torch.cuda.stream(self.prefetch_stream[layer_idx]):
+        # if True:
+            # self.clock[layer_idx]['attention_predictor_gpu_start'] = time.time()
+            # Prefetch next layer tensors to GPU
+            if attn.shape[-2] != 1: # prefilling
+                # offload kv_cache to CPU
+                self.offload_kv(layer_idx) # prefill layer2 0.38s
+            else: # decoding
+                attn = self.expand_attn(attn, layer_idx)
+            self.attn_history[layer_idx] = self.update_attn_history(self.attn_history[layer_idx], attn)
+            tsp_attn = self.time_sequence_predict(self.attn_history[layer_idx])
+            self.tsp_mask[layer_idx] = self.create_tsp_mask(self.attn_history[layer_idx][:,:,-1:,:], tsp_attn, topk=self.topk, layer_idx=layer_idx)
+            self.prefetch_stream[layer_idx].synchronize() # prefill 阶段等kv卸载完再加载
+            self.get_kv(self.tsp_mask[layer_idx], layer_idx)
+            # self.clock[layer_idx]['attention_predictor_gpu_end'] = time.time()
+            # if layer_idx <5:
+            #     print(f"Layer {layer_idx}: Attention predictor GPU time: {self.clock[layer_idx]['attention_predictor_gpu_end'] - self.clock[layer_idx]['attention_predictor_gpu_start']}")
+        #     print(f"Layer {layer_idx}: current stream is {torch.cuda.current_stream()}")
+        # print(f"Layer {layer_idx}: current stream is {torch.cuda.current_stream()}")
+        return
+    
+    def offload_kv(self, layer_idx: int):
+        # offload kv_cache to CPU
+        # print(f"Layer {layer_idx}: After synchronization, current stream is {torch.cuda.current_stream()}")
+        self.key_cache[layer_idx] = self.key_cache[layer_idx].to("cpu", non_blocking=True)
+        self.value_cache[layer_idx] = self.value_cache[layer_idx].to("cpu", non_blocking=True)
+        return
+     
+    def expand_attn(self, attn: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        # attn: [bs, head, 1, sparse_len+1]
+        # tsp_mask[layer_idx]: [bs, head, 1, seq_len]
+        # 生成一个[bs, head, 1, seq_len+1]形状的全零tensor，将attn的值填充到mask为0的位置和最后一个位置，返回
+        # 获取当前层的tsp_mask
+        tsp_mask = self.tsp_mask[layer_idx]
+        # 创建一个全零tensor，形状为[bs, head, 1, seq_len+1]
+        expanded_attn = torch.zeros(*tsp_mask.shape[:-1], tsp_mask.shape[-1], device=attn.device, dtype=attn.dtype)
+        # 获取需要保留的位置
+        sparse_indices = tsp_mask == 0
+        # 将attn的值填充到mask为0的位置和最后一个位置
+        expanded_attn.masked_scatter_(sparse_indices, attn[...,:-1])
+        expanded_attn = torch.cat([expanded_attn, attn[..., -1:]], dim=-1)
+        return expanded_attn
+
+    def get_kv(self, tsp_mask: torch.Tensor, layer_idx: int) -> Tuple[torch.Tensor]:
+        # tsp_mask: [bs, head, seq_len=1, token_idx]
+        # self.key_cache[layer_idx]: [bs, head, token_idx, hidden_dim=128]
+        # 根据mask位置，将key和value中的对应位置传输到gpu,存在key_buffer和value_buffer中
+        sparse_indices = tsp_mask.squeeze(-2) == 0
+        sparse_indices = sparse_indices.to(self.key_cache[layer_idx].device)
+        # 从key_cache中获取对应位置的key
+        key_sparse = self.key_cache[layer_idx][sparse_indices].view(tsp_mask.shape[0], tsp_mask.shape[1], -1, self.key_cache[layer_idx].shape[-1])
+        # 从value_cache中获取对应位置的value
+        value_sparse = self.value_cache[layer_idx][sparse_indices].view(tsp_mask.shape[0], tsp_mask.shape[1], -1, self.value_cache[layer_idx].shape[-1])
+        # 将key和value传输到GPU
+        device = self.original_device[layer_idx]
+        key_sparse = key_sparse.to(device)
+        value_sparse = value_sparse.to(device)
+        # 存储到keybuffer和valuebuffer中
+        self.key_buffer[layer_idx] = key_sparse.detach().clone()
+        self.value_buffer[layer_idx] = value_sparse.detach().clone()
+        return
+
+    def update_attn_history(self, attn_history, attn_weights_full):
+        attn_pooling = self.max_pooling(attn_weights_full, self.pooling_block_size)
+        if attn_history is None:
+            attn_history = attn_pooling[:, :, -self.history_step:]
+        else:
+            # attn_history: [bsz, head_num, 64, attn_len]
+            if attn_pooling.shape[-1] == attn_history.shape[-1]:
+                # 向上滚动一行，然后把新的一行放到最后
+                attn_history = torch.roll(attn_history, shifts=-1, dims=-2)
+                attn_history[:, :, -1:] = attn_pooling
+            else:
+                # 最后一列补零，先新建一个tensor，把原来的复制进去
+                new_shape = list(attn_history.shape)
+                new_shape[-1] += 1
+                new_attn_history = torch.zeros(new_shape, device=attn_history.device, dtype=attn_history.dtype)
+                new_attn_history[...,:-1, :-1] = attn_history[:, :, 1:]
+                attn_history = new_attn_history
+                attn_history[:, :, -1:] = attn_pooling
+        return attn_history
+    
+    def max_pooling(self, tensor, block_size):
+        # padding_size = (block_size - tensor.shape[-1] % block_size) % block_size
+        # padded_tensor = torch.cat([tensor, torch.zeros(tensor.shape[:-1] + (padding_size,), dtype=tensor.dtype, device=tensor.device)],dim=-1)
+        # pooled_tensor = padded_tensor.view(*padded_tensor.shape[:-1], -1, block_size).max(dim=-1)[0]
+        orig_shape = tensor.shape
+        tensor = tensor.reshape(-1, 1, tensor.shape[-1]) # [*, 1, L]
+        pooled = self.pooling(tensor)
+        # 恢复原来shape
+        new_shape = orig_shape[:-1] + (pooled.shape[-1],)
+        pooled = pooled.reshape(new_shape)
+        return pooled
+    
+    def time_sequence_predict(self, attn_history):
+        # attn_history = [bsz, head_num, 64, attn_len]
+        bsz, head_num, num_rows, attn_len = attn_history.shape
+        start = self.sink_token//self.pooling_block_size
+        end = attn_len-(self.local_token//self.pooling_block_size)
+        attn_history = attn_history[:, :, :, start:end]
+        attn_len = attn_history.shape[-1]
+
+        if end-start < 3: # CNN kernel is 3*3 size
+            tsp_attn = torch.ones(bsz, head_num, 1, attn_len).to(attn_history.device)
+            return tsp_attn
+        
+        with torch.no_grad():
+            inputs = attn_history.view(bsz * head_num, num_rows, attn_len) # 多个head同时预测
+            tsp_attn = self.model(inputs)
+        tsp_attn = tsp_attn.view(bsz, head_num, 1, attn_len)
+        return tsp_attn
+    
+    def create_tsp_mask(self, attn_weights, tsp_attn, topk=5, layer_idx=2):
+        # 修改：生成的mask值，mask掉的地方取-10000，topk和不足部分取0
+        # 创建和attn_weights相同形状的tsp_mask
+        # 此时得到的是上一步且压缩后attn大小，需要加一得到预测的mask大小
+        new_size = list(attn_weights.shape)
+        new_size[-1] = self.seen_token_list[layer_idx]
+        tsp_mask = torch.full(new_size, -10000.0, device=attn_weights.device).to(attn_weights.dtype)  # 初始化为 -10000
+
+        # 取tsp_attn的topk位置为1，生成mask,假设位置0
+        # print('tsp_attn:', tsp_attn.shape)
+        # print('attn_weights:', attn_weights.shape)
+        # print(topk, self.pooling_block_size)
+        # print(topk//self.pooling_block_size,tsp_attn.shape[-1])
+        if tsp_attn.shape[-1]<1:
+            tsp_mask[:, :, :, :self.sink_token] = 0
+            tsp_mask[:, :, :, -self.local_token:] = 0
+            return tsp_mask
+
+        _, topk_indices = torch.topk(tsp_attn, min((topk-self.sink_token-self.local_token)//self.pooling_block_size,tsp_attn.shape[-1]), dim=-1)
+        # print('topk_indices:', topk_indices.shape)
+        # 将形状从 [batch_size, topk] 扩展为 [batch_size, topk * self.pooling_block_size]，每个位置都扩展
+        # topk_indices = topk_indices.unsqueeze(-1) * self.pooling_block_size + torch.arange(self.pooling_block_size).to(topk_indices.device)
+        # topk_indices = topk_indices.view(*topk_indices.shape[:-2], -1)
+        # print('topk_indices:', topk_indices.shape)
+
+        # 将topk的位置设置为0，表示这些位置不被mask掉，假设位置0+sink，15+sink
+        tsp_mask.scatter_(-1, topk_indices + self.sink_token, 0)
+        # print('tsp_mask:', torch.sum(tsp_mask[0,0,0]==0))
+        overlap = (self.pooling_block_size - self._seen_tokens % self.pooling_block_size) % self.pooling_block_size
+        # 将tsp_mask的前sink个位置设置为0，表示这些位置不被mask掉
+        tsp_mask[:, :, :, :self.sink_token] = 0
+        # 最后local个位置不mask，local会和tsp生成的mask有所重合，但没事。
+        tsp_mask[:, :, :, -(self.local_token-overlap):] = 0
+        # 返回所有mask中=0的位置
+
+        return tsp_mask
+    
+    def update_old(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
+        Parameters:
+            key_states (`torch.Tensor`):
+                The new key states to cache.
+            value_states (`torch.Tensor`):
+                The new value states to cache.
+            layer_idx (`int`):
+                The index of the layer to cache the states for.
+            cache_kwargs (`Dict[str, Any]`, `optional`):
+                Additional arguments for the cache subclass. No additional arguments are used in `OffloadedCache`.
+        Return:
+            A tuple containing the updated key and value states.
+        """
+        # Update the number of seen tokens
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[-2]
+
+        # Update the cache
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+            self.original_device.append(key_states.device)
+            self.evict_previous_layer(layer_idx)
+        else:
+            key_tensor, value_tensor = self[layer_idx]
+            self.key_cache[layer_idx] = torch.cat([key_tensor, key_states], dim=-2)
+            self.value_cache[layer_idx] = torch.cat([value_tensor, value_states], dim=-2)
+
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    # According to https://docs.python.org/3/library/exceptions.html#NotImplementedError
+    # if a method is not supposed to be supported in a subclass we should set it to None
+    from_legacy_cache = None
+
+    to_legacy_cache = None
+
+对原始huggingface transformers官方实现的注意力的修改代码 attnpred_llamma_attention.py:
+# coding=utf-8
+
+import math
+from typing import List, Optional, Tuple, Union
+
+import torch
+import torch.utils.checkpoint
+from torch import nn
+from transformers.cache_utils import Cache, StaticCache
+from transformers.utils import (
+    logging,
+    is_flash_attn_greater_or_equal_2_10,
+)
+from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaAttention, LlamaFlashAttention2, apply_rotary_pos_emb, repeat_kv
+from transformers.modeling_flash_attention_utils import _flash_attention_forward
+
+__all__ = ['LlamaFlashAttention2_AttnPred', 'convert_kvcache_llama_attnpred']
+
+logger = logging.get_logger(__name__)
+
+
+class CNN(nn.Module): 
+    def __init__(self):
+        super(CNN, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(3, 3), padding=1)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=(3, 3), padding=1)
+        self.pool = nn.AdaptiveAvgPool2d((1, None))
+        self.conv3 = nn.Conv1d(in_channels=32, out_channels=1, kernel_size=1)  
+
+    def forward(self, x):
+        # x: (batch_size, a, b)
+        x = x.unsqueeze(1) # x: (batch_size, 1, a, b)
+        x = self.relu(self.conv1(x)) # (batch_size, 16, a, b)
+        x = self.relu(self.conv2(x)) # (batch_size, 32, a, b)
+        x = self.pool(x) # (batch_size, 64, 1, b)
+        x = x.view(x.size(0), x.size(1), -1)  # (batch_size, 64, b)
+        x = self.conv3(x)  # (batch_size, 1, b)
+        x = x.squeeze(1)  # (batch_size, b)
+        return x    
+
+class LlamaFlashAttention2_AttnPred(nn.Module):
+    """
+    Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
+    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
+    flash attention and deal with padding tokens in case the input contains any of them.
+    """
+    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
+        super(LlamaFlashAttention2_AttnPred, self).__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
+
+        # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
+        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+
+
+        ### AttentionPredictor
+        self.model = CNN()
+        # self.model.load_state_dict(torch.load('model/CNN_longchat_alltask_5case/best_model.pth', map_location='cuda:0'))
+        # self.model.load_state_dict(torch.load('model/CNN_llama3.1_alltask_5case/best_model.pth', map_location='cuda:0'))       
+
+        self.attn_history = None
+        self.topk = 1024
+        self.time_flag = True
+        self.sink_token = 64
+        self.local_token = 64
+        self.history_step = 64
+        self.pooling_block_size = 16
+        self.calibration_step = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if isinstance(past_key_value, StaticCache):
+            raise ValueError(
+                "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
+                "make sure to use `sdpa` in the mean time, and open an issue at https://github.com/huggingface/transformers"
+            )
+
+        output_attentions = False
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        # Flash attention requires the input to have the shape
+        # batch_size x seq_length x head_dim x hidden_dim
+        # therefore we just need to keep the original shape
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        # key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups)
+        if q_len==1: # decode don't use flash attention
+            self.decode_length = self.decode_length+1
+            # key_states = repeat_kv(key_states, self.num_key_value_groups)
+            # value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            if attention_mask is not None:  # no matter the length, we just slice it
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                attn_weights = attn_weights + causal_mask
+
+            ### start AttentionPredictor
+
+            # attn_weights_full = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+            # tsp_attn = self.time_series_predict(self.attn_history, token_id=key_states.shape[-2])
+            # tsp_mask = self.create_tsp_mask(attn_weights_full, tsp_attn, topk=self.topk)
+            # self.recovery_rate = torch.sum(attn_weights_full[torch.where(tsp_mask==0)])/torch.sum(attn_weights_full)
+            # attn_weights = attn_weights + tsp_mask
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+            past_key_value.attention_predictor_gpu(attn_weights, self.layer_idx)
+            
+            # if self.calibration_step is not None and self.decode_length % self.calibration_step == 0:
+            #     self.attn_history = self.update_attn_history(self.attn_history, attn_weights_full)
+            # else:
+            #     self.attn_history = self.update_attn_history(self.attn_history, attn_weights)
+
+            ### end AttentionPredictor
+
+            attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states)
+
+            if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+                raise ValueError(
+                    f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                    f" {attn_output.size()}"
+                )
+
+            attn_output = attn_output.transpose(1, 2)
+        
+        else: # prefill use flash attention
+            self.decode_length = 0
+            
+            
+            ### start AttentionPredictor
+            # calculate the last H tokens' attention for attention history
+            # key_states_for_history = repeat_kv(key_states, self.num_key_value_groups)
+            attn_weights = torch.matmul(query_states[:,:,-self.history_step:,:], key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            if attention_mask is not None:  # no matter the length, we just slice it
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                attn_weights = attn_weights + causal_mask
+
+            # self.attn_history = None
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            # attn_weights: [bsz, head_num, q_len=64, attn_len]
+            # self.attn_history = self.update_attn_history(self.attn_history, attn_weights)
+            past_key_value.attention_predictor_gpu(attn_weights, self.layer_idx)
+            ### end AttentionPredictor
+
+            ### Flash Attention
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+
+            dropout_rate = self.attention_dropout if self.training else 0.0
+
+            # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+            # therefore the input hidden states gets silently casted in float32. Hence, we need
+            # cast them back in the correct dtype just to be sure everything works as expected.
+            # This might slowdown training & inference so it is recommended to not cast the LayerNorms
+            # in fp32. (LlamaRMSNorm handles it correctly)
+
+            input_dtype = query_states.dtype
+            if input_dtype == torch.float32:
+                if torch.is_autocast_enabled():
+                    target_dtype = torch.get_autocast_gpu_dtype()
+                # Handle the case where the model is quantized
+                elif hasattr(self.config, "_pre_quantization_dtype"):
+                    target_dtype = self.config._pre_quantization_dtype
+                else:
+                    target_dtype = self.q_proj.weight.dtype
+
+                logger.warning_once(
+                    f"The input hidden states seems to be silently casted in float32, this might be related to"
+                    f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                    f" {target_dtype}."
+                )
+
+                query_states = query_states.to(target_dtype)
+                key_states = key_states.to(target_dtype)
+                value_states = value_states.to(target_dtype)
+
+            attn_output = _flash_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                q_len,
+                position_ids=position_ids,
+                dropout=dropout_rate,
+                sliding_window=getattr(self, "sliding_window", None),
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                is_causal=self.is_causal,
+            )
+
+        
+
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+    
+    def update_attn_history(self, attn_history, attn_weights_full):
+        if attn_history is None: # initialize attn_history
+            attn_pooling = self.max_pooling(attn_weights_full, self.pooling_block_size)
+            attn_history = attn_pooling[:, :, -self.history_step:, :]
+        else:
+            # attn_history: [bsz, head_num, 64, attn_len]
+            # update attn_history 
+            attn_pooling = self.max_pooling(attn_weights_full, self.pooling_block_size)
+            # after pooling, attn_pooling: [bsz, head_num, 1, attn_len/block_size]
+            if attn_pooling.shape[-1] == attn_history.shape[-1]:
+                attn_history = torch.cat([attn_history[:, :, 1:, :], attn_pooling], dim=-2)
+            else:
+                zero_padding = torch.zeros(attn_history.size(0), attn_history.size(1), attn_history.size(2)-1, 1, device=attn_history.device, dtype=attn_history.dtype)
+                attn_history = torch.cat([attn_history[:, :, 1:, :], zero_padding], dim=-1)
+                attn_history = torch.cat([attn_history, attn_pooling], dim=-2)
+        return attn_history
+    
+    def max_pooling(self, tensor, block_size):
+        # padding tensor with zeros
+        padding_size = (block_size - tensor.shape[-1] % block_size) % block_size
+        padded_tensor = torch.cat([tensor, torch.zeros(tensor.shape[:-1] + (padding_size,), dtype=tensor.dtype, device=tensor.device)],dim=-1)
+        # max pooling
+        pooled_tensor = padded_tensor.view(*padded_tensor.shape[:-1], -1, block_size).max(dim=-1)[0]
+        return pooled_tensor
+    
+    def time_series_predict(self, attn_history, token_id):
+        # attn_history: [bsz, head_num, 64, attn_len']
+        bsz, head_num, num_rows, attn_len = attn_history.shape
+        start = self.sink_token//self.pooling_block_size
+        end = attn_len-(self.local_token//self.pooling_block_size)
+        attn_history = attn_history[:, :, :, start:end]
+        attn_len = attn_history.shape[-1]
+
+        if end-start < 3: # CNN kernel is 3*3 size
+            tsp_attn = torch.ones(bsz, head_num, 1, attn_len).to(attn_history.device)
+            return tsp_attn
+        
+        with torch.no_grad():
+            inputs = attn_history.view(bsz * head_num, num_rows, attn_len) # predict all heads together
+            tsp_attn = self.model(inputs)
+        tsp_attn = tsp_attn.view(bsz, head_num, 1, attn_len)
+        return tsp_attn
+
+    def create_tsp_mask(self, attn_weights, tsp_attn, topk=5):
+        # drop positions=-10000, keep positions=0, attention_weights=mask+attention_weights
+        tsp_mask = torch.full_like(attn_weights, -10000.0).to(attn_weights.dtype)  # initialize with -10000
+
+        if tsp_attn.shape[-1]<1:
+            tsp_mask[:, :, :, :self.sink_token] = 0
+            tsp_mask[:, :, :, -self.local_token:] = 0
+            return tsp_mask
+
+        # get topk indices
+        _, topk_indices = torch.topk(tsp_attn, min((topk-self.sink_token-self.local_token)//self.pooling_block_size,tsp_attn.shape[-1]), dim=-1)
+
+        # expand block indices [batch_size, topk] to attention indices [batch_size, topk * self.pooling_block_size] 0->0~15
+        topk_indices = topk_indices.unsqueeze(-1) * self.pooling_block_size + torch.arange(self.pooling_block_size).to(topk_indices.device)
+        topk_indices = topk_indices.view(*topk_indices.shape[:-2], -1)
+
+        # set topk indices to 0
+        tsp_mask.scatter_(-1, topk_indices + self.sink_token, 0)
+        
+        # set sink_token and local_token to 0
+        tsp_mask[:, :, :, :self.sink_token] = 0
+        tsp_mask[:, :, :, -self.local_token:] = 0
+
+        return tsp_mask
+
+
+
+def convert_kvcache_llama_attnpred(model, model_type='llama-3.1', topk = 1024, skip_2layer=False, type = None, sink_token = 64, local_token = 64, calibration_step=5):
+    for name, module in model._modules.items():
+        if len(list(module.children())) > 0:
+            model._modules[name] = convert_kvcache_llama_attnpred(module, topk=topk, skip_2layer=skip_2layer, type = type, sink_token = sink_token, local_token = local_token, calibration_step=calibration_step)
+
+        if isinstance(module, LlamaAttention):
+            original_config = module.config
+            layer_idx = module.layer_idx
+            if skip_2layer and (layer_idx == 0 or layer_idx == 1):
+                continue
+            param_dtype = next(module.parameters()).dtype
+
+            if module.__class__ == LlamaFlashAttention2:
+                new_module = LlamaFlashAttention2_AttnPred(original_config, layer_idx)
+                # if 'llama-3.1' in model_type.lower():
+                #     new_module.model.load_state_dict(torch.load('./model/CNN_llama3.1_alltask_5case/best_model.pth', map_location='cuda:0'))
+                # elif 'longchat' in model_type.lower():
+                #     new_module.model.load_state_dict(torch.load('./model/CNN_longchat_alltask_5case/best_model.pth', map_location='cuda:0'))
+                # else:
+                #     Exception('model_type error')
+
+                # new_module.calibration_step = calibration_step
+                # new_module.topk = topk
+                # new_module.sink_token = sink_token
+                # new_module.local_token = local_token
+
+            for param in new_module.parameters():
+                param.data = param.data.to(param_dtype)
+            model._modules[name] = new_module
+    return model
+
+
+转换测试代码：
+def ours():
+    model_path = '/home/qyyang/kvcache/models/Meta-Llama-3.1-8B-Instruct'
+    model = LlamaForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        attn_implementation="flash_attention_2",
+        do_sample=False,
+    )
+
+    checkpoint = copy.deepcopy(model.state_dict())
+    model = convert_kvcache_llama_attnpred(model, model_type='llama-3.1', topk=1024, skip_2layer=True)
+    model.load_state_dict(checkpoint, strict=False)
+
+    model.eval().cuda()
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    prefill_len = args.prefill_len
+    decode_len = 10
+    prompt = [', '* prefill_len]
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    # extra_kwargs = {"cache_implementation": "offloaded_static"} if offload else {}
+    
+    # warmup
+    torch.cuda.empty_cache()
+    kv_cache = OffloadedCache(topk=args.topk)
+    _ = model.generate(**inputs, max_new_tokens=5, pad_token_id=tokenizer.eos_token_id, past_key_values = kv_cache)
+    del kv_cache
+
+    # torch.cuda.empty_cache()
+    # kv_cache = OffloadedCache(topk=args.topk)
+    # _ = model.generate(**inputs, max_new_tokens=5+decode_len, pad_token_id=tokenizer.eos_token_id, past_key_values = kv_cache)
+    # del kv_cache
+
+    decode_latency = []
+    results = []
+
+    for _ in tqdm(range(args.iteration)):
+        # clear cuda cache
+        torch.cuda.empty_cache()
+        kv_cache = OffloadedCache(topk=args.topk)
+        time_start = datetime.now()
+        output_ids = model.generate(**inputs, 
+                                    max_new_tokens=3, 
+                                    pad_token_id=tokenizer.eos_token_id, 
+                                    past_key_values = kv_cache
+                                    )
+        time_prefill = datetime.now() - time_start
+        # kv_cache.print_timing_breakdown()
+
+        del kv_cache
+        torch.cuda.empty_cache()
+        kv_cache = OffloadedCache(topk=args.topk)
+        time_start = datetime.now()
+        output_ids = model.generate(**inputs, 
+                                    max_new_tokens=decode_len+3, 
+                                    pad_token_id=tokenizer.eos_token_id,
+                                    past_key_values = kv_cache
+                                    )
+        time_decode = datetime.now() - time_start
+        # kv_cache.time_recorder.print_timing_breakdown()
+        results.append(kv_cache.time_recorder.compute_layer_token_diff_mean())
+        
+        del kv_cache
+        decode_latency.append(time_decode-time_prefill)
+
+    
+    avg_decode_latency = (np.mean(decode_latency)/ decode_len).total_seconds()
+    print(f"prefill_len: {prefill_len}, topk: {args.topk}, avg_decode_latency: {avg_decode_latency:.6f} seconds per token")
+    mean_of_dict_list(results)
+

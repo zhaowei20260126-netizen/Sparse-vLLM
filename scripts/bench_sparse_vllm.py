@@ -442,7 +442,7 @@ def main():
         default="{}",
         help=(
             "LLMEngine/Config hyper-params as JSON (string or @file.json). "
-            'Example: \'{"gpu_memory_utilization":0.9,"chunk_prefill_size":4096,"tensor_parallel_size":1,"num_top_tokens":2048}\''
+            'Example: \'{"gpu_memory_utilization":0.9,"c":4096,"tensor_parallel_size":1,"num_top_tokens":2048}\''
         ),
     )
     # Deprecated (kept for backward compatibility; prefer --hyper_params)

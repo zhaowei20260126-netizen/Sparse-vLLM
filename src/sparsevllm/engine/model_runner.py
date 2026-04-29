@@ -33,7 +33,7 @@ class ModelRunner:
         self.config = config
         
         # === 准备基础环境 ===
-        # 禁用自动求导，这个进程是推理专用，不需要梯度计算
+        # 禁用自动求导，这个进程是推理专用，不保存计算图的中间结果，显存占用大幅下降
         torch.set_grad_enabled(False)
         
         # 将当前进程的 rank 编号告诉分析器，用于性能统计时标识哪个进程
@@ -70,7 +70,7 @@ class ModelRunner:
             # 所有进程都会连接到 localhost:master_port 来建立通信
             master_port = int(os.getenv("SPARSEVLLM_MASTER_PORT", "2333"))
         
-            # 初始化分布式进程组，这个调用会进行 TCP 握手，让所有标记相同 world_size 和 rank 的进程相互发现
+            # 初始化分布式进程组，这个调用会进行 TCP 握手，让所有标记相同 world_size 的进程相互发现
             dist.init_process_group(
                 "nccl",  # 使用 NCCL 后端。NCCL 是 NVIDIA 的集合通信库，优化了 GPU 间的高速通信
                          # 比 CPU 间的 TCP/gloo 快得多
@@ -174,22 +174,22 @@ class ModelRunner:
 
     def exit(self):
         """
-        釋放資源並正確清理多進程環境。
-        包括：共享內存的關閉/取消鏈接，與分布式進程組的注銷。
+        释放资源并正确清理多进程环境。
+        包括：共享内存的关闭/取消链接，与分布式进程组的注销。
         """
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()  # 所有進程同步
+            dist.barrier()  # 所有进程同步
             if self.rank == 0:
-                self.shm.unlink()  # 只有 Rank 0 取消鏈接共享內存資源
-        torch.cuda.synchronize()  # 等待 GPU 執行完所有操作
-        dist.destroy_process_group()  # 銷毀分布式進程組
+                self.shm.unlink()  # 只有 Rank 0 取消链接共享内存资源
+        torch.cuda.synchronize()  # 等待 GPU 执行完所有操作
+        dist.destroy_process_group()  # 销毁分布式进程组
 
     def loop(self):
         """
-        子進程 (Rank > 0) 的主循環。
-        不斷從共享內存讀取來自 Rank 0 的方法調用指令，執行後繼續等待下一個指令。
-        當接收到 "exit" 指令時才會退出。
+        子进程 (Rank > 0) 的主循环。
+        不断从共享内存读取来自 Rank 0 的方法调用指令，执行后继续等待下一个指令。
+        当接收到 "exit" 指令时才会退出。
         """
         while True:
             method_name, args = self.read_shm()
@@ -269,10 +269,10 @@ class ModelRunner:
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 after = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots seq_id={} after={}", seq_id, after)
-
+    # 短文本（≤ 阈值）不触发稀疏优化，直接走完整注意力；只有超过阈值的长文本才启用稀疏
     def _long_text_threshold(self, is_prefill: bool) -> int:
         """
-        根据稀疏方法和阶段，计算区分「长文本」和「短文本」的阈值。
+        根据稀疏方法和阶段，计算区分「长文本」和「短文本」的阈值。短文本不稀疏
         
         设计理念：
         - 对于 Vanilla、SnapKV 等需要保留更多 token 的方法，短文本不触发稀疏优化
@@ -328,7 +328,7 @@ class ModelRunner:
         2. 设置全局上下文，包含 KV Cache 管理器和稀疏化标志
         3. 返回准备好的张量供 run_model 使用
         """
-        input_ids, positions, cu_seqlens_q = self.cache_manager.prepare_step(seqs, is_prefill)
+        input_ids, positions, cu_seqlens_q = self.cache_manager.prepare_step(seqs, is_prefill) # 同时内部设置buffer_req_to_token_slots，row_seq_lens，slot_mapping(slot_mapping保存在layer_batch_state中)
         set_context(
             is_prefill,
             cu_seqlens_q=cu_seqlens_q,
@@ -366,14 +366,14 @@ class ModelRunner:
         name = "model_run_prefill" if is_prefill else "model_run_decode"
         with profiler.record(name):
             # 第1步：准备前向上下文（获取 input_ids、positions 等）
-            ctx = get_context()
-            input_ids, positions = self.prepare_step(seqs, is_prefill)
+            ctx = get_context() # prepare_step: 为每一步前向计算准备输入数据和执行上下文，并将输入数据映射到slotmapping等中
+            input_ids, positions = self.prepare_step(seqs, is_prefill) # 从 CacheManager 获取本轮要处理的 token ID、位置编码，同时保留每个序列中每个token对应的slot索引
             
-            # 第2步：准备稀疏化状态
+            # 第2步：准备稀疏化状态（每一层的稀疏化状态）
             # 根据文本长度和稀疏方法，动态决定如何处理 token（保留或压缩）
             with profiler.record("model_sparse_prepare"):
                 ctx.sparse_controller = self.sparse_controller
-                self.sparse_controller.prepare_forward(seqs, is_prefill)
+                self.sparse_controller.prepare_forward(seqs, is_prefill) # 设置每一层的layer_batch_sparse_states（包含context_lens，req_indices，attn_score等）
             
             # 第3步：准备采样参数（仅 Rank 0 需要）
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None

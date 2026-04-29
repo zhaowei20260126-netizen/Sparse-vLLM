@@ -78,11 +78,15 @@ def _translate_deepseek_weight_name(model: nn.Module, weight_name: str) -> str |
 
 
 def _iter_deltakv_compressor_items(state_dict: dict[str, torch.Tensor]):
+    """
+    从 state_dict 中迭代所有压缩器相关的权重项。
+    
+    支持两种格式：
+    1) HF 风格按层："...layers.{i}....compress_down...."
+    2) 共享压缩器："compress_down...."（广播到所有层）
+    """
     for key, weight in state_dict.items():
         parts = key.split(".")
-        # Supported formats:
-        # 1) HF-style per-layer: "...layers.{i}....compress_down...."
-        # 2) Shared compressors: "compress_down...." (broadcast to all layers)
         if "compress_down" in parts:
             yield key, "compress_down", parts, weight
         elif "compress_up" in parts:
@@ -90,6 +94,13 @@ def _iter_deltakv_compressor_items(state_dict: dict[str, torch.Tensor]):
 
 
 def _infer_single_compressor_spec(state_dict: dict[str, torch.Tensor], comp_name: str):
+    """
+    从权重文件推断压缩器的架构规格。
+    
+    返回：(种类, 中间维度, 是否有偏置, 数据类型)
+    - 种类："linear", "mlp_gelu", "mlp_swiglu" 等
+    - 中间维度：MLP 的隐藏层大小（Linear 为 None）
+    """
     bias = False
     inferred_kind = None
     inferred_intermediate = None
@@ -108,17 +119,17 @@ def _infer_single_compressor_spec(state_dict: dict[str, torch.Tensor], comp_name
             bias = True
 
         head = sub_parts[0]
-        # nn.Linear: "...compress_down.weight" / "...compress_down.bias"
+        # nn.Linear: 直接的权重矩阵
         if head in ("weight", "bias"):
             inferred_kind = inferred_kind or "linear"
             continue
-        # nn.Sequential: "...compress_down.0.weight" / "...compress_down.2.weight"
+        # nn.Sequential 的 MLP（GELU激活）
         if head.isdigit():
             inferred_kind = inferred_kind or "mlp_gelu"
             if head == "0" and sub_parts[-1] == "weight":
                 inferred_intermediate = inferred_intermediate or int(weight.shape[0])
             continue
-        # SwiGLU: "...compress_down.w12.weight" / "...compress_down.w3.weight"
+        # SwiGLU 风格的 MLP
         if head == "w12":
             inferred_kind = inferred_kind or "mlp_swiglu"
             if sub_parts[-1] == "weight":
@@ -129,6 +140,11 @@ def _infer_single_compressor_spec(state_dict: dict[str, torch.Tensor], comp_name
 
 
 def _infer_kv_compressed_size(state_dict: dict[str, torch.Tensor]) -> int | None:
+    """
+    从权重文件推断 KV 缓存的压缩大小。
+    
+    通过查看压缩器的输出维度来推断（compress_down 的输出 = compress_up 的输入）。
+    """
     for _, name, parts, weight in _iter_deltakv_compressor_items(state_dict):
         comp_token_idx = parts.index(name)
         sub_parts = parts[comp_token_idx + 1:]
@@ -137,22 +153,32 @@ def _infer_kv_compressed_size(state_dict: dict[str, torch.Tensor]) -> int | None
 
         head = sub_parts[0]
         if name == "compress_down":
+            # compress_down 的输出维度
             if head in ("weight", "2", "w3"):
                 return int(weight.shape[0])
         else:
+            # compress_up 的输入维度（应与 compress_down 输出相同）
             if head in ("weight", "0", "w12"):
                 return int(weight.shape[1])
     return None
 
 
 def _resolve_deltakv_checkpoint_files(path: str) -> tuple[str, list[str], bool]:
+    """
+    定位 DeltaKV checkpoint 文件。
+    
+    支持目录（查找所有权重文件）或单个文件。
+    返回：(checkpoint 目录, 权重文件列表, 是否是 safetensors 格式)
+    """
     if os.path.isdir(path):
+        # 优先查找 safetensors 格式（更快），其次是 .bin 或 .pt
         files = sorted(glob(os.path.join(path, "*.safetensors")))
         is_safetensors = len(files) > 0
         if not is_safetensors:
             files = sorted(glob(os.path.join(path, "*.bin")) + glob(os.path.join(path, "*.pt")))
         ckpt_dir = path
     elif os.path.isfile(path):
+        # 单个文件情况
         files = [path]
         is_safetensors = path.endswith(".safetensors")
         ckpt_dir = os.path.dirname(path)
@@ -165,6 +191,11 @@ def _resolve_deltakv_checkpoint_files(path: str) -> tuple[str, list[str], bool]:
 
 
 def _load_deltakv_state_dict(file: str, *, is_safetensors: bool) -> dict[str, torch.Tensor]:
+    """
+    加载 DeltaKV checkpoint 的权重字典。
+    
+    支持 safetensors（更快、更安全）和 PyTorch .pt/.bin 格式。
+    """
     if is_safetensors:
         with safe_open(file, "pt", "cpu") as f:
             return {k: f.get_tensor(k) for k in f.keys()}
@@ -172,18 +203,33 @@ def _load_deltakv_state_dict(file: str, *, is_safetensors: bool) -> dict[str, to
 
 
 def sync_deltakv_config_from_checkpoint(config) -> bool:
+    """
+    从 DeltaKV checkpoint 中同步压缩器配置到运行时配置。
+    
+    流程：
+    1. 优先从 checkpoint 目录的 config.json 读取配置
+    2. 如果缺少某些配置参数，从权重文件推断（推断压缩器的架构类型、大小等）
+    3. 将新配置应用到 config 对象中
+    
+    返回：True 表示有配置被修改，False 表示无变化
+    """
+    # 检查是否配置了 DeltaKV checkpoint 和方法
     path = getattr(config, "deltakv_path", None)
     method = str(getattr(config, "vllm_sparse_method", "") or "")
     if not path or not method.startswith("deltakv"):
         return False
 
+    # 定位 checkpoint 文件
     ckpt_dir, files, is_safetensors = _resolve_deltakv_checkpoint_files(path)
     updates: dict[str, object] = {}
+    
+    # ==================== 第1步：从 config.json 读取配置 ====================
     config_json = os.path.join(ckpt_dir, "config.json")
     if os.path.isfile(config_json):
         with open(config_json, "r", encoding="utf-8") as f:
             ckpt_cfg = json.load(f)
 
+        # 提取压缩器相关的配置参数
         for key in (
             "kv_compressed_size",
             "use_nonlinear_compressor",
@@ -197,12 +243,15 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
             if key in ckpt_cfg:
                 updates[key] = ckpt_cfg[key]
 
+        # 检查是否使用了不支持的 split_kv 模式（K 和 V 分别压缩）
         if ckpt_cfg.get("split_kv", False):
             raise NotImplementedError(
                 "Detected split_kv DeltaKV checkpoint from config.json. "
                 "sparsevllm DeltaKVCacheManager currently expects unified compress_down/compress_up."
             )
 
+    # ==================== 第2步：从权重文件推断缺失的配置 ====================
+    # 如果 config.json 中缺少某些必要配置，则从权重文件推断
     missing_shape_keys = {
         "kv_compressed_size",
         "compressor_down_type",
@@ -214,7 +263,9 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
     }
     need_weight_inference = bool(missing_shape_keys.difference(updates.keys()))
     state_dict = None
+    
     if need_weight_inference:
+        # 加载权重文件以推断压缩器架构
         for file in files:
             state_dict = _load_deltakv_state_dict(file, is_safetensors=is_safetensors)
             if any("compress_down" in key or "compress_up" in key for key in state_dict):
@@ -222,9 +273,12 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
             state_dict = None
 
         if state_dict is not None:
+            # 从权重文件推断压缩器的配置参数
             kv_compressed_size = _infer_kv_compressed_size(state_dict)
             down_kind, down_inter, down_bias, _ = _infer_single_compressor_spec(state_dict, "compress_down")
             up_kind, up_inter, up_bias, _ = _infer_single_compressor_spec(state_dict, "compress_up")
+            
+            # 填充缺失的配置项
             if kv_compressed_size is not None and "kv_compressed_size" not in updates:
                 updates["kv_compressed_size"] = kv_compressed_size
             if down_kind is not None and "compressor_down_type" not in updates:
@@ -240,6 +294,7 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
             if down_bias == up_bias and "compressor_linear_bias" not in updates:
                 updates["compressor_linear_bias"] = bool(down_bias)
 
+            # 检查是否使用了不支持的 split_kv 格式
             for key in state_dict.keys():
                 if ".k_compress_down." in key or ".v_compress_down." in key or ".k_compress_up." in key or ".v_compress_up." in key:
                     raise NotImplementedError(
@@ -247,6 +302,7 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
                         "sparsevllm DeltaKVCacheManager currently expects unified compress_down/compress_up."
                     )
 
+    # ==================== 第3步：应用配置更新 ====================
     changed: dict[str, tuple[object, object]] = {}
     for key, value in updates.items():
         if value is None or not hasattr(config, key):
@@ -254,10 +310,12 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
         current = getattr(config, key)
         if isinstance(value, str):
             value = value.strip().lower() or "auto"
+        # 仅在配置值发生变化时才更新
         if current != value:
             setattr(config, key, value)
             changed[key] = (current, value)
 
+    # 记录日志
     if changed:
         changes_str = ", ".join(f"{key}: {old} -> {new}" for key, (old, new) in changed.items())
         logger.info(f"Synced DeltaKV config from checkpoint {ckpt_dir}: {changes_str}")
@@ -444,44 +502,127 @@ def load_deltakv_compressors_to_cache_manager(cache_manager, path: str):
 
 
 def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_size: int | None = None):
+    """
+    从 safetensors 权重文件加载模型权重。
+    
+    功能：
+    - 支持多进程张量并行（Tensor Parallel）分片加载
+    - 支持模型架构转换（DeepSeek HF 格式 → sparsevllm 格式）
+    - 支持融合投影层合并（如 q/k/v_proj → qkv_proj）
+    
+    参数：
+    - model: 目标 PyTorch 模型
+    - path: 权重文件所在目录
+    - rank: 当前 GPU 进程编号（TP 场景下用于分片加载）
+    - world_size: 总进程数（TP 场景下用于分片加载）
+    """
+    # ==================== 第1步：获取打包模块映射 ====================
+    # 打包模块映射规则用于将多个独立权重（如 q_proj, k_proj, v_proj）
+    # 合并到单个融合权重（如 qkv_proj）以加速推理
+    # 例如 Qwen2 的规则：{"q_proj": ("qkv_proj", 0), "k_proj": ("qkv_proj", 1), ...}
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    
+    # 发现权重目录中的所有 .safetensors 文件
     files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert len(files) > 0, f"No safetensors found in {path}"
 
-    # DeepSeek official converters often emit one file per rank:
-    #   model{rank}-mp{world_size}.safetensors
-    # In that case we should only load the local rank shard.
+    # ==================== 第2步：处理张量并行（TP）分片加载 ====================
+    # 如果是分布式推理（rank 和 world_size 都提供），则按 Rank 加载对应的权重分片
+    # 
+    # DeepSeek 官方转换器的分片格式：model{rank}-mp{world_size}.safetensors
+    # 例如 TP=4 时的文件：
+    #   model0-mp4.safetensors (Rank 0 的权重分片)
+    #   model1-mp4.safetensors (Rank 1 的权重分片)
+    #   model2-mp4.safetensors (Rank 2 的权重分片)
+    #   model3-mp4.safetensors (Rank 3 的权重分片)
     if rank is not None and world_size is not None:
+        # 构造该 Rank 对应的权重分片文件名
         shard = os.path.join(path, f"model{rank}-mp{world_size}.safetensors")
         if os.path.isfile(shard):
+            # ✓ 找到了该 Rank 的分片，只加载这个文件
+            # 这样可以节省内存（只加载 1/world_size 的权重）
             files = [shard]
         else:
+            # 检查是否存在其他 Rank 的分片（表示确实是分片模式）
             mp_files = sorted(glob(os.path.join(path, f"model*-mp{world_size}.safetensors")))
             if mp_files:
+                # ✗ 发现了分片模式但缺少当前 Rank 的文件，这是致命错误
+                # （可能是用户传入了错误的权重目录或 Rank/world_size 参数）
                 raise FileNotFoundError(
                     "Detected per-rank weight shards but missing expected shard for this rank. "
                     f"expected={shard} available={mp_files}"
                 )
+            # 如果既没有该 Rank 的分片也没有其他 Rank 的分片，
+            # 则按默认模式加载（使用上面发现的全量权重文件）
     
+    # ==================== 第3步：核心加载循环 ====================
+    # 逐个加载权重文件中的所有参数
     loaded_count = 0
     for file in files:
+        # 使用 safetensors 库开启文件句柄（加载到 CPU，后续模型会移到 GPU）
         with safe_open(file, "pt", "cpu") as f:
             for source_weight_name in f.keys():
+                # ——————— 第3a步：权重名称转换 ———————
+                # 将 HuggingFace 标准命名转换为 sparsevllm 内部命名（仅针对 DeepSeek 模型）
+                # 
+                # 转换示例：
+                #   model.embed_tokens.weight → tok_embeddings.weight
+                #   model.norm.weight → norm.weight
+                #   model.lm_head.weight → output.weight
+                #   model.layers.0.self_attn.q_proj.weight → layers.0.attn.wq.weight
+                #   model.layers.0.mlp.gate_proj.weight → layers.0.ffn.w1.weight
+                #
+                # 对于非 DeepSeek 模型，_translate_deepseek_weight_name() 返回 None，
+                # 此时 `or source_weight_name` 会使用原始权重名
                 param_name = _translate_deepseek_weight_name(model, source_weight_name) or source_weight_name
+                
+                # ——————— 第3b步：检查打包模块处理 ———————
+                # 如果该权重匹配到打包规则，则需要特殊处理（权重合并）
+                packed_found = False
                 for k in packed_modules_mapping:
                     if k in param_name:
+                        # 匹配到打包规则
+                        # 例如 param_name="layers.0.self_attn.q_proj.weight"，k="q_proj"
+                        # packed_modules_mapping["q_proj"] = ("qkv_proj", 0)
+                        # → v="qkv_proj", shard_id=0
                         v, shard_id = packed_modules_mapping[k]
+                        
+                        # 替换参数名：q_proj → qkv_proj
                         packed_param_name = param_name.replace(k, v)
+                        # 例如：layers.0.self_attn.q_proj.weight → layers.0.self_attn.qkv_proj.weight
+                        
+                        # 获取融合后的目标参数（它比单个权重大，包含多个分量）
                         param = model.get_parameter(packed_param_name)
+                        
+                        # 调用该参数的自定义 weight_loader 方法
+                        # weight_loader 负责将当前权重（q_proj）切片插入到融合权重的对应位置
                         weight_loader = getattr(param, "weight_loader")
                         weight_loader(param, f.get_tensor(source_weight_name), shard_id)
+                        
                         loaded_count += 1
+                        packed_found = True
                         break
-                else:
-                    param = model.get_parameter(param_name)
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(source_weight_name))
-                    loaded_count += 1
+                
+                if packed_found:
+                    # 已处理过打包逻辑，继续加载下一个权重
+                    continue
+                
+                # ——————— 第3c步：常规加载（未匹配到打包规则） ———————
+                # 直接获取参数并加载权重（不需要特殊处理）
+                param = model.get_parameter(param_name)
+                
+                # 优先使用参数的自定义 weight_loader（某些特殊权重可能需要自定义处理逻辑）
+                # 其次使用默认的复制逻辑（default_weight_loader = param.data.copy_(loaded_weight)）
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, f.get_tensor(source_weight_name))
+                
+                loaded_count += 1
     
+    # ==================== 第4步：验证和反馈 ====================
+    # 确保至少加载了一个权重
+    # （防止路径错误、权重文件损坏或权重文件被删除导致的静默失败）
     assert loaded_count > 0, f"No weights were loaded from {path}"
+    
+    # 打印加载统计信息用于调试和日志
+    # 便于用户确认权重加载的成功与否以及加载的权重数量
     print(f"Successfully loaded {loaded_count} weights from {path}")

@@ -178,14 +178,14 @@ class Qwen2Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        context = get_context()
+        context = get_context()  # ★ 获取全局上下文
         
         for i, layer in enumerate(self.layers):
-            context.now_layer_idx = i
+            context.now_layer_idx = i  # ★ 注入点 : 设置当前层号
             hidden_states, residual = layer(positions, hidden_states, residual)
             
             # 回调控制器执行稀疏逻辑
-            if self.sparse_controller is not None:
+            if self.sparse_controller is not None: # ★ 注入点 : 稀疏回调
                 self.sparse_controller.on_layer_end(i, context)
                 
         hidden_states, _ = self.norm(hidden_states, residual)
