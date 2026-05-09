@@ -410,7 +410,7 @@ class Scheduler:
         
         # 从 decoding 队列中逐个选择序列进行增量生成
         while self.decoding and num_batched_seqs < self.max_num_seqs_in_batch:
-            seq = self._pop_next_decoding_seq(target_is_long_decode)
+            seq = self._pop_next_decoding_seq(target_is_long_decode) # decoding队列弹出来一个（pop）
             if seq is None:
                 # 没有符合条件的序列
                 break

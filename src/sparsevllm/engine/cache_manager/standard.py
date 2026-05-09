@@ -426,7 +426,7 @@ class StandardCacheManager(CacheManager):
             seq_ids = [seq.seq_id for seq in seqs]
 
             # 为整个批次分配 batch_size 个新插槽（每个序列 1 个）
-            new_slots_batch = self._allocate_batch(seq_ids, 1)
+            new_slots_batch = self._allocate_batch(seq_ids, 1) # 返回 select_indices，shape: (batch_size,)
             # 获取各序列的缓冲区行
             row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
             # 各序列当前的上下文长度（prefill + 已 decode 的令牌数）

@@ -411,7 +411,7 @@ def main():
         default="vanilla,snapkv,omnikv",
         help="Methods to test (vanilla, streamingllm, attention-sink, snapkv, pyramidkv, omnikv, quest, deltakv, deltakv-triton, deltakv-triton-v2, deltakv-triton-v3, deltakv-triton-v3-offload, deltakv-triton-v3-cuda-offload)",
     )
-    parser.add_argument("--output_len", type=int, default=512, help="Output tokens per request")
+    parser.add_argument("--output_len", type=int, default=2, help="Output tokens per request")
     parser.add_argument(
         "--temperature",
         type=float,

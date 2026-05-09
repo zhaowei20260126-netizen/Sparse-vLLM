@@ -183,7 +183,7 @@ class LLMEngine:
         # === 第7步：预热模型 ===
         # 触发算子编译和内存分配，预热后系统可投入使用
         self._warmup()
-        self._throughput_logger.start()
+        # self._throughput_logger.start()
 
     def _warmup(self):
         """预热模型，确保所有算子和显存都已就绪"""
