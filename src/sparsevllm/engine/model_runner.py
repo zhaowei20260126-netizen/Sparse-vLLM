@@ -100,6 +100,9 @@ class ModelRunner:
         # 在 TP 场景下，只加载该进程负责的权重分片
         if hf_config.model_type == "qwen2":
             self.model = Qwen2ForCausalLM(hf_config)
+        elif hf_config.model_type == "llama":
+            from sparsevllm.models.llama import LlamaForCausalLM
+            self.model = LlamaForCausalLM(hf_config)
         elif hf_config.model_type == "deepseek_v2":
             self.model = DeepSeekV2ForCausalLM(
                 hf_config,

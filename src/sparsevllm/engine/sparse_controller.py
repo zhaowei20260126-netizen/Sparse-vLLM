@@ -201,8 +201,9 @@ class SparseController:
         返回 (active_slots, active_indices, req_indices, context_lens, attn_score, temp_slots)
         """
         sparse_state = self.layer_batch_sparse_states[layer_idx]
-        if (self.sparse_method in ("omnikv", "deltakv") and layer_idx in self.full_attn_layers) or \
-            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', 'streamingllm', 'attention-sink', 'attention_sink', ''):
+        # TODO attnpredict每层都需要预测吧？
+        if (self.sparse_method in ("omnikv", "deltakv", "attnpredict") and layer_idx in self.full_attn_layers) or \
+            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', 'streamingllm', 'attention-sink', 'attention_sink', 'attnpredict', ''):
 
             return (
                 self.cache_manager.get_layer_buffer_req_to_token_slots(layer_idx),  # 全部 token slots
@@ -280,11 +281,24 @@ class SparseController:
             raise ValueError
 
     def on_layer_end(self, layer_idx: int, context):
-        """每一层结束后的动态策略 (如 OmniKV / DeltaKV)"""
+        """每一层结束后的动态策略 (如 OmniKV / DeltaKV / AttnPredict)"""
+
+        # --- AttnPredict: predict mask from every decode layer's attention ---
+        if self.sparse_method == 'attnpredict' and not context.is_prefill:
+            state = self.layer_batch_sparse_states[layer_idx]
+            if state.attn_score is not None:
+                # Head max-pooling: single mask per layer (same as OmniKV pattern)
+                if state.attn_score.dim() == 3:
+                    attn_maps = state.attn_score.max(dim=1).values  # (B, seq_len)
+                else:
+                    attn_maps = state.attn_score
+                self.cache_manager.predict_next_mask(layer_idx, attn_maps)
+            return
+
         if get_context().is_long_text is False and not self.is_deltakv_family:
             return
 
-        if self.sparse_method not in ('omnikv', 'deltakv'):
+        if self.sparse_method not in ('omnikv', 'deltakv', 'attnpredict'):
             return
 
         if context.is_prefill and not self.config.chunk_prefill_accel_omnikv:
@@ -594,6 +608,14 @@ class SparseController:
         # 只在 prefill 最后一个 chunk 时收集，且必须是长文本。
         # 策略: 综合所有层的注意力分数，选出最重要的 token 做静态剪枝（永久删除），
         #       剩余 token 再由 DeltaKV 压缩为 latent。这里的 attn_score 只用于剪枝阶段。
+        # =====================================================================
+        # 分支 0: AttnPredict — 每层 decode 时都需要 attn_score
+        # =====================================================================
+        # decode 时每层都收集 softmax 后的注意力分数，CNN 用此来预测下一时刻的注意力分布。
+        # prefill 不需要（不做预测，全量 attention）。
+        if self.sparse_method == 'attnpredict':
+            return not is_prefill
+
         if self.sparse_method == 'deltakv-snapkv':
             if not is_prefill or get_context().is_long_text is False:
                 return False

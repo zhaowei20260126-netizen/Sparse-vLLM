@@ -150,6 +150,10 @@ class CacheManager(ABC):
             from .snapkv import SnapKVCacheManager
 
             return SnapKVCacheManager(config, rank, world_size)
+        if sparse_method == "attnpredict":
+            from .attnpredict import AttnPredictCacheManager
+
+            return AttnPredictCacheManager(config, rank, world_size)
         if sparse_method == "quest":
             from .quest import QuestCacheManager
 

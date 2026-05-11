@@ -25,7 +25,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "deltakv-standalone", "deltakv-snapkv", "pyramidkv", "dsa"
+    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "deltakv-standalone", "deltakv-snapkv", "pyramidkv", "dsa", "attnpredict"
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -42,6 +42,14 @@ class Config:
     quest_chunk_size: int = 16
     quest_token_budget: int = 1024
     quest_skip_layers: int = 2
+
+    # AttentionPredictor Config
+    attnpredict_topk: int = 1024
+    attnpredict_history_steps: int = 64
+    attnpredict_pooling_block_size: int = 16
+    attnpredict_sink_tokens: int = 64
+    attnpredict_local_tokens: int = 64
+    attnpredict_model_path: str = ""
 
     # SnapKV Config
     snapkv_window_size: int = 32
