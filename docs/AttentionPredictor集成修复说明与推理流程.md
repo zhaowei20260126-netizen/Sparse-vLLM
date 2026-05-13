@@ -103,8 +103,8 @@ cache_manager.observe_prefill_attention(...)
 
 - `attnpredict_model_path` 必填。
 - checkpoint 路径必须存在。
-- `attnpredict_topk`、`attnpredict_history_steps`、`attnpredict_pooling_block_size` 必须大于 0。
-- sink/local token 数不能小于 0。
+- `attnpredict_history_steps`、`attnpredict_pooling_block_size` 必须大于 0。
+- AttentionPredictor 复用通用稀疏预算：`num_top_tokens` 必须大于 0，`num_sink_tokens` / `num_recent_tokens` 不能小于 0。
 
 这样可以避免没有 checkpoint 时静默使用随机 CNN。
 
@@ -123,11 +123,11 @@ cache_manager.observe_prefill_attention(...)
 补充 `attnpredict` 到支持方法列表，并增加参数说明：
 
 - `attnpredict_model_path`
-- `attnpredict_topk`
 - `attnpredict_history_steps`
 - `attnpredict_pooling_block_size`
-- `attnpredict_sink_tokens`
-- `attnpredict_local_tokens`
+- `num_top_tokens`
+- `num_sink_tokens`
+- `num_recent_tokens`
 
 ### 8. `docs/attnpredict_integration_changes.md`
 

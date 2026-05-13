@@ -115,10 +115,9 @@ Set `vllm_sparse_method` to one of:
 `attnpredict` runtime knobs:
 
 - `attnpredict_model_path`: CNN checkpoint path (required)
-- `attnpredict_topk`: total token budget including sink/local tokens (default `1024`)
 - `attnpredict_history_steps`: rolling attention history rows (default `64`)
 - `attnpredict_pooling_block_size`: token block size for max pooling (default `16`)
-- `attnpredict_sink_tokens`, `attnpredict_local_tokens`: always-kept prefix/tail tokens
+- Uses the common sparse budget knobs: `num_top_tokens`, `num_sink_tokens`, and `num_recent_tokens`
 
 ## How to test
 

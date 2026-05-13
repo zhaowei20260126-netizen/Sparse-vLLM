@@ -44,11 +44,8 @@ class Config:
     quest_skip_layers: int = 2
 
     # AttentionPredictor Config
-    attnpredict_topk: int = 1024
     attnpredict_history_steps: int = 64
     attnpredict_pooling_block_size: int = 16
-    attnpredict_sink_tokens: int = 64
-    attnpredict_local_tokens: int = 64
     attnpredict_model_path: str = ""
 
     # SnapKV Config
@@ -181,14 +178,14 @@ class Config:
                 raise ValueError("vllm_sparse_method='attnpredict' 需要设置 attnpredict_model_path")
             if not os.path.isfile(self.attnpredict_model_path):
                 raise FileNotFoundError(f"attnpredict_model_path 不存在: {self.attnpredict_model_path}")
-            if self.attnpredict_topk <= 0:
-                raise ValueError("attnpredict_topk 必须 > 0")
+            if int(self.num_top_tokens) <= 0:
+                raise ValueError("attnpredict 使用的 num_top_tokens 必须 > 0")
+            if self.num_sink_tokens < 0 or self.num_recent_tokens < 0:
+                raise ValueError("attnpredict 使用的 num_sink_tokens/num_recent_tokens 不能 < 0")
             if self.attnpredict_history_steps <= 0:
                 raise ValueError("attnpredict_history_steps 必须 > 0")
             if self.attnpredict_pooling_block_size <= 0:
                 raise ValueError("attnpredict_pooling_block_size 必须 > 0")
-            if self.attnpredict_sink_tokens < 0 or self.attnpredict_local_tokens < 0:
-                raise ValueError("attnpredict sink/local tokens 不能 < 0")
 
         # Normalize compressor type strings.
         for attr in ("compressor_down_type", "compressor_up_type"):

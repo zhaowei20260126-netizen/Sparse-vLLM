@@ -62,7 +62,7 @@
         "--temperature",
         "0.0",
         "--hyper_params",
-        "{\"gpu_memory_utilization\": 0.8, \"chunk_prefill_size\": 4096, \"tensor_parallel_size\": 1, \"attnpredict_model_path\": \"\", \"attnpredict_topk\": 1024, \"attnpredict_history_steps\": 64, \"attnpredict_pooling_block_size\": 16, \"attnpredict_sink_tokens\": 64, \"attnpredict_local_tokens\": 64}"
+        "{\"gpu_memory_utilization\": 0.8, \"chunk_prefill_size\": 4096, \"tensor_parallel_size\": 1, \"attnpredict_model_path\": \"\", \"attnpredict_history_steps\": 64, \"attnpredict_pooling_block_size\": 16, \"num_top_tokens\": 4096, \"num_sink_tokens\": 64, \"num_recent_tokens\": 512}"
       ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",

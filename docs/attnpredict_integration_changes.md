@@ -128,12 +128,11 @@ Decode Step t:
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `attnpredict_topk` | `int` | `1024` | 保留的 token 总数上限 |
 | `attnpredict_history_steps` | `int` | `64` | attention 历史快照步数 |
 | `attnpredict_pooling_block_size` | `int` | `16` | max pooling 的 block 大小 |
-| `attnpredict_sink_tokens` | `int` | `64` | 强制保留的 sink token 数 |
-| `attnpredict_local_tokens` | `int` | `64` | 强制保留的 local token 数 |
 | `attnpredict_model_path` | `str` | `""` | CNN checkpoint 路径 |
+
+AttentionPredictor 的 token 预算复用通用稀疏配置：`num_top_tokens`、`num_sink_tokens`、`num_recent_tokens`。
 
 **`vllm_sparse_method` 文档**: 添加 `"attnpredict"` 到可选值列表。
 
@@ -239,9 +238,9 @@ llm = LLM(
     model="/path/to/Meta-Llama-3.1-8B-Instruct",
     vllm_sparse_method="attnpredict",
     attnpredict_model_path="/path/to/CNN_llama3.1_alltask_5case/best_model.pth",
-    attnpredict_topk=1024,
-    attnpredict_sink_tokens=64,
-    attnpredict_local_tokens=64,
+    num_top_tokens=4096,
+    num_sink_tokens=64,
+    num_recent_tokens=512,
     gpu_memory_utilization=0.5,
 )
 

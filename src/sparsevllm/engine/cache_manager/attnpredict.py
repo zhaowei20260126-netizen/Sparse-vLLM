@@ -22,11 +22,11 @@ class AttnPredictCacheManager(StandardCacheManager):
     def __init__(self, config: Config, rank: int, world_size: int):
         super().__init__(config, rank, world_size)
 
-        self.topk = int(config.attnpredict_topk)
+        self.topk = int(config.num_top_tokens)
         self.history_step = int(config.attnpredict_history_steps)
         self.pooling_block_size = int(config.attnpredict_pooling_block_size)
-        self.sink_token = int(config.attnpredict_sink_tokens)
-        self.local_token = int(config.attnpredict_local_tokens)
+        self.sink_token = int(config.num_sink_tokens)
+        self.local_token = int(config.num_recent_tokens)
         self.attn_scale = self.head_dim ** -0.5
 
         # Per-layer, per-cache-row state. Cache rows survive across decode steps;
@@ -356,7 +356,7 @@ class AttnPredictCacheManager(StandardCacheManager):
         if pred_len < 1:
             return keep_mask
 
-        block_budget = (self.topk - self.sink_token - self.local_token) // self.pooling_block_size
+        block_budget = self.topk // self.pooling_block_size
         block_budget = max(0, min(block_budget, pred_len))
         if block_budget <= 0:
             return keep_mask
