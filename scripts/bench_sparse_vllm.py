@@ -82,7 +82,7 @@ def benchmark_task(method, length, bs, args, results_dict):
     # vanilla 对应空字符串，其他方法名和设置值一致
     if method == "vanilla":
         sparse_kwargs["vllm_sparse_method"] = ""  # 空字符串表示不使用稀疏
-    elif method in ("streamingllm", "attention-sink", "attention_sink", "snapkv", "pyramidkv", "omnikv", "quest", "deltakv"):
+    elif method in ("streamingllm", "attention-sink", "attention_sink", "snapkv", "pyramidkv", "omnikv", "quest", "deltakv", "attnpredict"):
         sparse_kwargs["vllm_sparse_method"] = method  # 直接使用方法名
     elif "deltakv" in method:
         # 支持 deltakv-triton, deltakv-triton-v2, deltakv-triton-v3 等变体
@@ -409,7 +409,7 @@ def main():
         "--methods",
         type=str,
         default="vanilla,snapkv,omnikv",
-        help="Methods to test (vanilla, streamingllm, attention-sink, snapkv, pyramidkv, omnikv, quest, deltakv, deltakv-triton, deltakv-triton-v2, deltakv-triton-v3, deltakv-triton-v3-offload, deltakv-triton-v3-cuda-offload)",
+        help="Methods to test (vanilla, streamingllm, attention-sink, snapkv, pyramidkv, omnikv, quest, attnpredict, deltakv, deltakv-triton, deltakv-triton-v2, deltakv-triton-v3, deltakv-triton-v3-offload, deltakv-triton-v3-cuda-offload)",
     )
     parser.add_argument("--output_len", type=int, default=2, help="Output tokens per request")
     parser.add_argument(
