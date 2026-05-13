@@ -103,6 +103,7 @@ Set `vllm_sparse_method` to one of:
 - `"snapkv"`, `"pyramidkv"` (physical eviction)
 - `"omnikv"` (logical masking)
 - `"quest"` (query-aware page selection on decode; prefill stays full attention)
+- `"attnpredict"` (AttentionPredictor-style temporal attention prediction; full KV remains on GPU)
 - `"deltakv"` / `"deltakv-*"` (hybrid compression; optional / experimental, see [DeltaKV](#deltakv))
 
 `quest` runtime knobs:
@@ -110,6 +111,14 @@ Set `vllm_sparse_method` to one of:
 - `quest_chunk_size`: QuEST page/chunk size in tokens (default `16`)
 - `quest_token_budget`: decode-time token budget before page rounding (default `1024`)
 - `quest_skip_layers`: keep the first N layers dense during decode (default `2`)
+
+`attnpredict` runtime knobs:
+
+- `attnpredict_model_path`: CNN checkpoint path (required)
+- `attnpredict_topk`: total token budget including sink/local tokens (default `1024`)
+- `attnpredict_history_steps`: rolling attention history rows (default `64`)
+- `attnpredict_pooling_block_size`: token block size for max pooling (default `16`)
+- `attnpredict_sink_tokens`, `attnpredict_local_tokens`: always-kept prefix/tail tokens
 
 ## How to test
 

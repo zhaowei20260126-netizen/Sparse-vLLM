@@ -380,6 +380,27 @@ class CacheManager(ABC):
         """
         return None
 
+    def observe_prefill_attention(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+    ) -> None:
+        """Optional prefill-time attention observer.
+
+        Methods such as AttentionPredictor may need q/k-derived attention rows
+        during prefill to initialize decode-time metadata. The default is a
+        no-op so attention.py can stay method-agnostic.
+        """
+        return None
+
     def build_decode_view(
         self,
         layer_idx: int,

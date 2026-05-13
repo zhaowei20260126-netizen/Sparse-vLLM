@@ -206,6 +206,18 @@ class Attention(nn.Module):
                 b_prompt_cache_len = b_seq_len - chunk_lens        # 每个序列的历史 KV 长度
                 max_input_len = b_seq_len.max().item()
 
+                cache_manager.observe_prefill_attention(
+                    context.now_layer_idx,
+                    q,
+                    k_cache,
+                    layer_active_slots,
+                    b_req_idx,
+                    layer_context_lens,
+                    context.cu_seqlens_q,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                )
+
                 # Triton 路径需要物理槽位 layer_active_slots 用于 Req_to_tokens 寻址
                 # 它内部通过 prompt_cache_len 实现因果掩码，目前不需要显式的 pos_ids
                 o = torch.empty_like(q)

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from sparsevllm.config import Config
 from sparsevllm.utils.profiler import profiler
 
-from .base import CacheManager
 from .standard import StandardCacheManager
 from .attnpredict_cnn import AttnPredictCNN
 
@@ -13,18 +13,10 @@ from .attnpredict_cnn import AttnPredictCNN
 class AttnPredictCacheManager(StandardCacheManager):
     """KV cache manager with AttentionPredictor-guided token selection.
 
-    Extends StandardCacheManager (full KV on GPU). During decode, a small CNN
-    predicts which historical token blocks will be important for the NEXT step.
-    The predicted mask is applied via build_decode_view() to filter active_slots.
-
-    Prediction pipeline:
-      decode step t:
-        1. attention produces attn_weights (softmax scores)
-        2. on_layer_end → predict_next_mask():
-           max_pool(x16) → update rolling history → CNN forward → create mask
-           → store in self.tsp_mask[layer_idx]
-      decode step t+1:
-        3. build_decode_view() applies tsp_mask[layer_idx] to filter slots
+    The original AttentionPredictor cache keeps a rolling attention history per
+    layer and predicts the next step's sparse KV set. Sparse-vLLM keeps full KV
+    on GPU in this v1 integration, so the predicted set is applied as a logical
+    decode view rather than as a CPU-to-GPU KV prefetch buffer.
     """
 
     def __init__(self, config: Config, rank: int, world_size: int):
@@ -35,55 +27,96 @@ class AttnPredictCacheManager(StandardCacheManager):
         self.pooling_block_size = int(config.attnpredict_pooling_block_size)
         self.sink_token = int(config.attnpredict_sink_tokens)
         self.local_token = int(config.attnpredict_local_tokens)
+        self.attn_scale = self.head_dim ** -0.5
 
-        # Per-layer state
-        self.attn_history: list[torch.Tensor | None] = [None] * self.num_layers
-        self.tsp_mask: list[torch.Tensor | None] = [None] * self.num_layers
+        # Per-layer, per-cache-row state. Cache rows survive across decode steps;
+        # batch positions do not, so row keys are the stable sequence identity.
+        self.attn_history: list[dict[int, torch.Tensor]] = [
+            {} for _ in range(self.num_layers)
+        ]
+        self.tsp_mask: list[dict[int, torch.Tensor]] = [
+            {} for _ in range(self.num_layers)
+        ]
+        self._last_decode_view: list[dict[str, torch.Tensor | None] | None] = [
+            None for _ in range(self.num_layers)
+        ]
 
-        # Shared CNN predictor (float16 for efficiency, same as original)
         self.cnn = AttnPredictCNN()
-        model_path = config.attnpredict_model_path
-        if model_path:
-            state_dict = torch.load(model_path, map_location="cuda", weights_only=False)
-            self.cnn.load_state_dict(state_dict)
-        self.cnn.to(dtype=self.hf_config.torch_dtype, device="cuda")
+        model_path = str(config.attnpredict_model_path or "")
+        state_dict = torch.load(model_path, map_location="cuda", weights_only=False)
+        self.cnn.load_state_dict(state_dict)
+        self.cnn.to(dtype=torch.float16, device="cuda")
         self.cnn.eval()
+        self.cnn_dtype = next(self.cnn.parameters()).dtype
 
-        # JIT-scripted MaxPool1d for block-wise pooling
-        self.pooling = torch.nn.MaxPool1d(
-            kernel_size=self.pooling_block_size,
-            stride=self.pooling_block_size,
-            padding=0,
-            ceil_mode=True,
-        )
-        self.pooling = torch.jit.script(self.pooling).eval()
+    def free_seq(self, seq_id: int):
+        row_idx = self.seq_id_to_row.get(seq_id)
+        super().free_seq(seq_id)
+        if row_idx is None:
+            return
+        for layer_idx in range(self.num_layers):
+            self.attn_history[layer_idx].pop(int(row_idx), None)
+            self.tsp_mask[layer_idx].pop(int(row_idx), None)
 
     @torch.no_grad()
-    def predict_next_mask(self, layer_idx: int, attn_weights: torch.Tensor):
-        """Update attention history and predict mask for the next decode step.
+    def observe_prefill_attention(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+    ) -> None:
+        """Initialize/update history from the last history_step prefill queries.
 
-        Called from SparseController.on_layer_end() after attention produces
-        softmax scores.
-
-        Args:
-            layer_idx: current layer index
-            attn_weights: (B, seq_len) — already max-pooled over heads
+        This mirrors the original implementation's prefill branch, which computes
+        attention for the last 64 query rows and feeds those rows into the CNN so
+        the first decode step can already use a predicted sparse view.
         """
-        # 1. Pool attention weights into blocks of size pooling_block_size
-        pooled = self._max_pool_1d(attn_weights)  # (B, seq_len) → (B, seq_len//block)
+        if cu_seqlens_q is None or cu_seqlens_q.numel() <= 1:
+            return
 
-        # 2. Update rolling history window
-        self._update_attn_history(layer_idx, pooled)
+        with profiler.record("attnpredict_observe_prefill_attention"):
+            group_size = max(1, num_heads // max(1, num_kv_heads))
+            batch_size = int(req_indices.numel())
+            for b in range(batch_size):
+                q_end = int(cu_seqlens_q[b + 1].item())
+                q_start = int(cu_seqlens_q[b].item())
+                q_len = q_end - q_start
+                if q_len <= 0:
+                    continue
 
-        # 3. CNN predict future attention from history
-        hist = self.attn_history[layer_idx]
-        if hist is None:
-            return  # Not enough history yet; first 64 steps use full attention
+                full_len = int(context_lens[b].item())
+                if full_len <= 0:
+                    continue
 
-        tsp_attn = self._cnn_predict(hist)  # (B, pooled_seq_len)
+                row_idx = int(req_indices[b].item())
+                take = min(self.history_step, q_len)
+                q_tail = q[q_end - take:q_end].to(torch.float32)
 
-        # 4. Create token-level mask from block predictions
-        self.tsp_mask[layer_idx] = self._create_tsp_mask(layer_idx, tsp_attn)
+                slots = active_slots[row_idx, :full_len].to(torch.long)
+                k_full = k_cache.index_select(0, slots).to(torch.float32)
+                if group_size > 1:
+                    k_full = k_full.repeat_interleave(group_size, dim=1)
+                k_full = k_full[:, :num_heads, :]
+
+                logits = torch.einsum("thd,lhd->htl", q_tail, k_full)
+                logits *= self.attn_scale
+
+                q_positions = torch.arange(
+                    full_len - take, full_len, device=q.device
+                )
+                kv_positions = torch.arange(full_len, device=q.device)
+                causal_mask = kv_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
+                logits = logits.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
+                attn = torch.softmax(logits, dim=-1).to(self.hf_config.torch_dtype)
+
+                self._update_row_prediction(layer_idx, row_idx, attn)
 
     @torch.no_grad()
     def build_decode_view(
@@ -97,167 +130,243 @@ class AttnPredictCacheManager(StandardCacheManager):
         num_heads: int,
         num_kv_heads: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Override to filter active_slots based on predicted attention mask.
-
-        Follows the QuEST pattern: if mask is available, pack only selected
-        KV slots into a dense tensor and return adjusted context lengths.
-        """
-        mask = self.tsp_mask[layer_idx]
-        if mask is None:
-            return active_slots, req_indices, context_lens
-
+        """Apply the previous step's predicted mask to the current decode view."""
         with profiler.record("attnpredict_build_decode_view"):
-            batch_size = mask.shape[0]
-            # mask: (B, seq_len); 0=keep, -10000=drop
-            keep_mask = mask == 0
-            keep_counts = keep_mask.sum(dim=-1)   # (B,)
-            max_keep = int(keep_counts.max().item())
+            batch_size = int(req_indices.numel())
+            row_positions: list[torch.Tensor] = []
+            keep_counts: list[int] = []
+            any_sparse = False
 
-            if max_keep == 0:
+            for b in range(batch_size):
+                row_idx = int(req_indices[b].item())
+                full_len = int(context_lens[b].item())
+                if full_len <= 0:
+                    positions = torch.empty(0, dtype=torch.long, device=q.device)
+                    row_positions.append(positions)
+                    keep_counts.append(0)
+                    continue
+
+                pred_mask = self.tsp_mask[layer_idx].get(row_idx)
+                if pred_mask is None:
+                    positions = torch.arange(full_len, dtype=torch.long, device=q.device)
+                else:
+                    any_sparse = True
+                    valid_len = min(int(pred_mask.numel()), full_len)
+                    if valid_len > 0:
+                        positions = pred_mask[:valid_len].nonzero(as_tuple=False).squeeze(-1)
+                        positions = positions.to(device=q.device, dtype=torch.long)
+                    else:
+                        positions = torch.empty(0, dtype=torch.long, device=q.device)
+
+                    # The current decode token was just appended to the physical
+                    # cache. The previous prediction cannot know it, but the
+                    # original implementation always concatenates this newest KV.
+                    current_pos = torch.tensor([full_len - 1], dtype=torch.long, device=q.device)
+                    positions = torch.unique(torch.cat([positions, current_pos]), sorted=True)
+
+                row_positions.append(positions)
+                keep_counts.append(int(positions.numel()))
+
+            if not any_sparse:
+                self._last_decode_view[layer_idx] = {
+                    "req_indices": req_indices.detach().clone(),
+                    "positions": None,
+                    "view_lens": context_lens.detach().clone(),
+                    "full_context_lens": context_lens.detach().clone(),
+                }
                 return active_slots, req_indices, context_lens
 
-            # Pack selected slots into a dense [B, max_keep] tensor
+            max_keep = max(keep_counts) if keep_counts else 0
+            if max_keep <= 0:
+                self._last_decode_view[layer_idx] = None
+                return active_slots, req_indices, context_lens
+
             packed_slots = torch.full(
-                (batch_size, max_keep), -1, dtype=torch.int32, device=mask.device
+                (batch_size, max_keep), -1, dtype=torch.int32, device=q.device
             )
-            # We need to map [req_idx, keep_position] → physical slot.
-            # active_slots is (batch_size, max_model_len) from get_read_view.
-            # Each row b needs: active_slots[b][keep_mask[b]] → packed_slots[b]
-            for b in range(batch_size):
-                k = int(keep_counts[b].item())
-                if k > 0:
-                    # keep_mask[b] has True at positions to keep; gather those slots
-                    row_keep = keep_mask[b].nonzero(as_tuple=False).squeeze(-1)[:max_keep]
-                    packed_slots[b, :k] = active_slots[b, row_keep]
+            packed_positions = torch.full(
+                (batch_size, max_keep), -1, dtype=torch.int32, device=q.device
+            )
+            for b, positions in enumerate(row_positions):
+                k = int(positions.numel())
+                if k == 0:
+                    continue
+                row_idx = int(req_indices[b].item())
+                packed_positions[b, :k] = positions.to(torch.int32)
+                packed_slots[b, :k] = active_slots[row_idx, positions].to(torch.int32)
 
-            local_req_indices = torch.arange(batch_size, dtype=torch.int32, device=mask.device)
-            return packed_slots, local_req_indices, keep_counts.to(torch.int32)
+            view_lens = torch.tensor(keep_counts, dtype=torch.int32, device=q.device)
+            local_req_indices = torch.arange(batch_size, dtype=torch.int32, device=q.device)
+            self._last_decode_view[layer_idx] = {
+                "req_indices": req_indices.detach().clone(),
+                "positions": packed_positions.detach(),
+                "view_lens": view_lens.detach().clone(),
+                "full_context_lens": context_lens.detach().clone(),
+            }
+            return packed_slots, local_req_indices, view_lens
 
-    # ---------- Internal helpers ----------
-
-    def _max_pool_1d(self, attn: torch.Tensor) -> torch.Tensor:
-        """Max-pool attention weights along seq dim with pooling_block_size.
-
-        Args:
-            attn: (B, seq_len) — already head-pooled
-
-        Returns:
-            pooled: (B, 1, seq_len//block_size)
-        """
-        orig_shape = attn.shape
-        # Reshape for MaxPool1d: [B, 1, L]
-        x = attn.view(attn.shape[0], 1, -1)
-        if x.shape[-1] < self.pooling_block_size:
-            # Pad to at least one block
-            pad = self.pooling_block_size - x.shape[-1]
-            x = torch.nn.functional.pad(x, (0, pad))
-        pooled = self.pooling(x.to(torch.float32))
-        return pooled.to(attn.dtype)  # (B, 1, L//block)
-
-    def _update_attn_history(self, layer_idx: int, pooled: torch.Tensor):
-        """Maintain a rolling window of 64 pooled attention snapshots.
-
-        pooled: (B, 1, pooled_len) — single-step attention pooled into blocks.
-        """
-        hist = self.attn_history[layer_idx]
-        if hist is None:
-            # Initialize: take last history_step columns (padding if not enough)
-            if pooled.shape[-1] >= self.history_step:
-                hist = pooled[:, :, -self.history_step:]
-            else:
-                pad = self.history_step - pooled.shape[-1]
-                hist = torch.nn.functional.pad(pooled, (pad, 0))
-            self.attn_history[layer_idx] = hist
+    @torch.no_grad()
+    def predict_next_mask(self, layer_idx: int, attn_logits: torch.Tensor) -> None:
+        """Update history from decode attention logits and predict next mask."""
+        view = self._last_decode_view[layer_idx]
+        if view is None:
             return
 
-        if pooled.shape[-1] == hist.shape[-1]:
-            # seq_len unchanged: roll up and replace last row
-            hist = torch.roll(hist, shifts=-1, dims=-2)
-            hist[:, :, -1:] = pooled
-        else:
-            # seq_len grew: pad history, then replace last row
-            new_hist = torch.zeros(
-                hist.shape[0], hist.shape[1], hist.shape[2], pooled.shape[-1],
-                device=hist.device, dtype=hist.dtype,
-            )
-            new_hist[:, :, :, :hist.shape[-1]] = hist
-            new_hist = torch.roll(new_hist, shifts=-1, dims=-2)
-            new_hist[:, :, -1:] = pooled
-            hist = new_hist
+        with profiler.record("attnpredict_predict_next_mask"):
+            if attn_logits.dim() == 2:
+                attn_logits = attn_logits.unsqueeze(1)
 
-        self.attn_history[layer_idx] = hist
+            req_indices = view["req_indices"]
+            positions = view["positions"]
+            view_lens = view["view_lens"]
+            full_context_lens = view["full_context_lens"]
+            assert req_indices is not None
+            assert view_lens is not None
+            assert full_context_lens is not None
 
-    def _cnn_predict(self, hist: torch.Tensor) -> torch.Tensor:
-        """Run CNN to predict future attention from history.
+            batch_size = int(req_indices.numel())
+            for b in range(batch_size):
+                row_idx = int(req_indices[b].item())
+                view_len = int(view_lens[b].item())
+                full_len = int(full_context_lens[b].item())
+                if view_len <= 0 or full_len <= 0:
+                    continue
+
+                logits = attn_logits[b, :, :view_len].to(torch.float32)
+                attn = torch.softmax(logits * self.attn_scale, dim=-1)
+
+                if positions is None:
+                    full_attn = attn[:, :full_len]
+                else:
+                    pos = positions[b, :view_len].to(device=attn.device, dtype=torch.long)
+                    full_attn = torch.zeros(
+                        (attn.shape[0], full_len),
+                        dtype=attn.dtype,
+                        device=attn.device,
+                    )
+                    full_attn.scatter_(1, pos.unsqueeze(0).expand(attn.shape[0], -1), attn)
+
+                self._update_row_prediction(
+                    layer_idx,
+                    row_idx,
+                    full_attn.unsqueeze(1).to(self.hf_config.torch_dtype),
+                )
+
+    # ---------- AttentionPredictor helpers ----------
+
+    def _update_row_prediction(
+        self,
+        layer_idx: int,
+        row_idx: int,
+        attn_weights_full: torch.Tensor,
+    ) -> None:
+        """Update one row's history and store its predicted keep mask.
 
         Args:
-            hist: (B, 1, history_steps=64, pooled_seq_len)
-
-        Returns:
-            tsp_attn: (B, pooled_seq_len)
+            attn_weights_full: (num_heads, q_rows, full_seq_len) softmax weights.
         """
-        # CNN expects (B, history_steps, pooled_seq_len)
-        x = hist.squeeze(1)  # (B, 64, pooled_len)
-        return self.cnn(x.contiguous())
+        hist = self._update_attn_history(
+            self.attn_history[layer_idx].get(row_idx),
+            attn_weights_full,
+        )
+        self.attn_history[layer_idx][row_idx] = hist
 
-    def _create_tsp_mask(self, layer_idx: int, tsp_attn: torch.Tensor) -> torch.Tensor:
-        """Create token-level mask from block-level predictions.
-
-        Always keeps: sink_token (prefix) + local_token (suffix) + topk blocks.
-
-        Args:
-            layer_idx: current layer index
-            tsp_attn: (B, pooled_seq_len) — CNN-predicted block importance
-
-        Returns:
-            mask: (B, seq_len) — 0=keep, -10000=drop
-        """
-        batch_size = tsp_attn.shape[0]
-        seq_len = self.row_seq_lens[self.seq_id_to_row.get(
-            list(self.seq_id_to_row.keys())[0], 0
-        )] if self.seq_id_to_row else 0
-
-        # Use max context length from current batch state
-        ctx_lens = self.layer_batch_state.context_lens
-        if ctx_lens is not None:
-            max_seq_len = int(ctx_lens.max().item())
-        else:
-            max_seq_len = seq_len
-
-        mask = torch.full(
-            (batch_size, max_seq_len), -10000.0,
-            device=tsp_attn.device, dtype=torch.float32,
+        tsp_attn, start_block = self._time_sequence_predict(hist)
+        seq_len = int(attn_weights_full.shape[-1])
+        self.tsp_mask[layer_idx][row_idx] = self._create_tsp_mask(
+            tsp_attn,
+            seq_len=seq_len,
+            start_block=start_block,
+            device=attn_weights_full.device,
         )
 
-        # Always keep sink tokens
-        sink_end = min(self.sink_token, max_seq_len)
-        mask[:, :sink_end] = 0
+    def _max_pooling(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Pool the attention sequence dimension exactly like the original code."""
+        padding_size = (self.pooling_block_size - tensor.shape[-1] % self.pooling_block_size) % self.pooling_block_size
+        if padding_size:
+            tensor = F.pad(tensor, (0, padding_size))
+        pooled = tensor.view(*tensor.shape[:-1], -1, self.pooling_block_size).max(dim=-1).values
+        return pooled
 
-        # Always keep local tokens (last N tokens)
-        local_start = max(sink_end, max_seq_len - self.local_token)
-        mask[:, local_start:] = 0
+    def _update_attn_history(
+        self,
+        attn_history: torch.Tensor | None,
+        attn_weights_full: torch.Tensor,
+    ) -> torch.Tensor:
+        attn_pooling = self._max_pooling(attn_weights_full)
+        if attn_pooling.shape[-2] > self.history_step:
+            attn_pooling = attn_pooling[:, -self.history_step:, :]
 
-        # Select top-k blocks from CNN prediction
-        pooled_len = tsp_attn.shape[-1]
-        if pooled_len > 0:
-            # How many blocks to select (excluding sink and local blocks)
-            sink_blocks = self.sink_token // self.pooling_block_size
-            local_blocks = self.local_token // self.pooling_block_size
-            num_blocks_to_select = (self.topk - self.sink_token - self.local_token) // self.pooling_block_size
-            num_blocks_to_select = max(0, min(num_blocks_to_select, pooled_len - sink_blocks - local_blocks))
+        if attn_history is None:
+            if attn_pooling.shape[-2] < self.history_step:
+                pad_rows = self.history_step - attn_pooling.shape[-2]
+                attn_pooling = F.pad(attn_pooling, (0, 0, pad_rows, 0))
+            return attn_pooling
 
-            if num_blocks_to_select > 0:
-                _, topk_block_indices = torch.topk(tsp_attn[:, sink_blocks:pooled_len - local_blocks],
-                                                   num_blocks_to_select, dim=-1)
-                # Convert block indices to token indices
-                token_indices = (topk_block_indices + sink_blocks).unsqueeze(-1) * self.pooling_block_size \
-                    + torch.arange(self.pooling_block_size, device=tsp_attn.device)
-                token_indices = token_indices.view(batch_size, -1)
-                # Clamp to valid token range
-                token_indices = token_indices.clamp(0, max_seq_len - 1)
+        old_len = int(attn_history.shape[-1])
+        new_len = int(attn_pooling.shape[-1])
+        if new_len > old_len:
+            attn_history = F.pad(attn_history, (0, new_len - old_len))
+        elif new_len < old_len:
+            attn_history = attn_history[..., :new_len]
 
-                for b in range(batch_size):
-                    valid_idx = token_indices[b][token_indices[b] < max_seq_len]
-                    mask[b, valid_idx] = 0
+        hist = torch.cat([attn_history, attn_pooling], dim=-2)
+        return hist[:, -self.history_step:, :]
 
-        return mask
+    def _time_sequence_predict(self, attn_history: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """Run the CNN over the non-sink/non-local pooled block range."""
+        num_heads, num_rows, attn_len = attn_history.shape
+        start = self.sink_token // self.pooling_block_size
+        end = attn_len - (self.local_token // self.pooling_block_size)
+        end = max(start, end)
+        attn_history = attn_history[:, :, start:end]
+        pred_len = int(attn_history.shape[-1])
+
+        if pred_len < 3:
+            return torch.ones(
+                (num_heads, pred_len),
+                dtype=attn_history.dtype,
+                device=attn_history.device,
+            ), start
+
+        inputs = attn_history.reshape(num_heads, num_rows, pred_len)
+        tsp_attn = self.cnn(inputs.to(self.cnn_dtype).contiguous())
+        return tsp_attn.to(torch.float32), start
+
+    def _create_tsp_mask(
+        self,
+        tsp_attn: torch.Tensor,
+        *,
+        seq_len: int,
+        start_block: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Create a shared token-level keep mask from block predictions."""
+        keep_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        if seq_len <= 0:
+            return keep_mask
+
+        sink_end = min(self.sink_token, seq_len)
+        keep_mask[:sink_end] = True
+
+        local_start = max(sink_end, seq_len - self.local_token)
+        keep_mask[local_start:] = True
+
+        pred_len = int(tsp_attn.shape[-1])
+        if pred_len < 1:
+            return keep_mask
+
+        block_budget = (self.topk - self.sink_token - self.local_token) // self.pooling_block_size
+        block_budget = max(0, min(block_budget, pred_len))
+        if block_budget <= 0:
+            return keep_mask
+
+        block_scores = tsp_attn.max(dim=0).values if tsp_attn.dim() == 2 else tsp_attn
+        _, topk_indices = torch.topk(block_scores, block_budget, dim=-1)
+        token_indices = (
+            (topk_indices + start_block).unsqueeze(-1) * self.pooling_block_size
+            + torch.arange(self.pooling_block_size, device=device)
+        ).reshape(-1)
+        token_indices = token_indices[token_indices < seq_len]
+        keep_mask[token_indices] = True
+        return keep_mask

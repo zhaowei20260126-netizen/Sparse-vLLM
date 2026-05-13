@@ -87,7 +87,8 @@ class SparseController:
           2. 为需要收集注意力分数的层（obs layers / SnapKV 所有层等）分配 attn_score 张量
 
         之后模型逐层前向时:
-          - attention kernel 将 softmax 后的权重写入 attn_score
+          - attention kernel 将当前稀疏方法需要的分数写入 attn_score
+            （例如 AttnPredict decode 路径写入未 scale 的 raw logits）
           - on_layer_end() 读取 attn_score 做 top-k 选择，动态更新下游 sparse layer 的视图
 
         设计要点:
@@ -287,12 +288,7 @@ class SparseController:
         if self.sparse_method == 'attnpredict' and not context.is_prefill:
             state = self.layer_batch_sparse_states[layer_idx]
             if state.attn_score is not None:
-                # Head max-pooling: single mask per layer (same as OmniKV pattern)
-                if state.attn_score.dim() == 3:
-                    attn_maps = state.attn_score.max(dim=1).values  # (B, seq_len)
-                else:
-                    attn_maps = state.attn_score
-                self.cache_manager.predict_next_mask(layer_idx, attn_maps)
+                self.cache_manager.predict_next_mask(layer_idx, state.attn_score)
             return
 
         if get_context().is_long_text is False and not self.is_deltakv_family:
@@ -611,7 +607,7 @@ class SparseController:
         # =====================================================================
         # 分支 0: AttnPredict — 每层 decode 时都需要 attn_score
         # =====================================================================
-        # decode 时每层都收集 softmax 后的注意力分数，CNN 用此来预测下一时刻的注意力分布。
+        # decode 时每层都收集 attention logits，cache manager 会按原始实现转成 softmax 权重。
         # prefill 不需要（不做预测，全量 attention）。
         if self.sparse_method == 'attnpredict':
             return not is_prefill

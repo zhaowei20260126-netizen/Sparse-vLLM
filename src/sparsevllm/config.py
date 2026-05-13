@@ -176,6 +176,19 @@ class Config:
             raise ValueError("quest_token_budget 必须 > 0")
         if self.quest_skip_layers < 0:
             raise ValueError("quest_skip_layers 不能 < 0")
+        if self.vllm_sparse_method == "attnpredict":
+            if not self.attnpredict_model_path:
+                raise ValueError("vllm_sparse_method='attnpredict' 需要设置 attnpredict_model_path")
+            if not os.path.isfile(self.attnpredict_model_path):
+                raise FileNotFoundError(f"attnpredict_model_path 不存在: {self.attnpredict_model_path}")
+            if self.attnpredict_topk <= 0:
+                raise ValueError("attnpredict_topk 必须 > 0")
+            if self.attnpredict_history_steps <= 0:
+                raise ValueError("attnpredict_history_steps 必须 > 0")
+            if self.attnpredict_pooling_block_size <= 0:
+                raise ValueError("attnpredict_pooling_block_size 必须 > 0")
+            if self.attnpredict_sink_tokens < 0 or self.attnpredict_local_tokens < 0:
+                raise ValueError("attnpredict sink/local tokens 不能 < 0")
 
         # Normalize compressor type strings.
         for attr in ("compressor_down_type", "compressor_up_type"):
