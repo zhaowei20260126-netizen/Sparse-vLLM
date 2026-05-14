@@ -31,7 +31,9 @@ Claude Code 初版集成已经把 `attnpredict` 注册进 Sparse-vLLM，但存�
   - `attn_history[row]`: `(num_heads, history_steps=64, pooled_len)`
   - 单步 decode attention 会作为 `(num_heads, 1, full_seq_len)` 追加
 - 新增 `observe_prefill_attention(...)`：
-  - prefill 阶段计算最后 `history_steps` 个 query 对完整 KV 的 attention
+  - 非最后 prefill chunk 直接跳过
+  - 最后一个 prefill chunk 取末尾 `history_steps` 个 query 对完整 KV 的 attention
+  - 最后一个 prefill chunk 结束时生成首个 decode mask
   - 与原始实现中 `query_states[:, :, -self.history_step:, :]` 的逻辑一致
   - 用于让首个 decode step 前已有 CNN 预测 mask
 - 重写 `build_decode_view(...)`：
@@ -105,6 +107,7 @@ cache_manager.observe_prefill_attention(...)
 - checkpoint 路径必须存在。
 - `attnpredict_history_steps`、`attnpredict_pooling_block_size` 必须大于 0。
 - AttentionPredictor 复用通用稀疏预算：`num_top_tokens` 必须大于 0，`num_sink_tokens` / `num_recent_tokens` 不能小于 0。
+- 严格对齐原始 AttentionPredictor：`num_top_tokens` 对应原始 `topk` 总预算，包含 sink 和 recent/local token；CNN 额外选择的中间区域预算为 `num_top_tokens - num_sink_tokens - num_recent_tokens`。
 
 这样可以避免没有 checkpoint 时静默使用随机 CNN。
 
@@ -125,7 +128,7 @@ cache_manager.observe_prefill_attention(...)
 - `attnpredict_model_path`
 - `attnpredict_history_steps`
 - `attnpredict_pooling_block_size`
-- `num_top_tokens`
+- `num_top_tokens`（在 `attnpredict` 中对应原始 `topk` 总预算，包含 sink/recent）
 - `num_sink_tokens`
 - `num_recent_tokens`
 
@@ -191,7 +194,7 @@ flowchart TD
 
 prefill 仍执行完整 attention。额外增加的工作是：
 
-1. 对每个层、每个序列，取最后 `attnpredict_history_steps` 个 query。
+1. 对每个层、每个序列，只在最后一个 prefill chunk 取末尾 `attnpredict_history_steps` 个 query。
 2. 用当前层已经写入 GPU 的 full KV cache 计算 attention。
 3. 更新 `attn_history`。
 4. CNN 预测出首个 decode step 可用的 `tsp_mask`。

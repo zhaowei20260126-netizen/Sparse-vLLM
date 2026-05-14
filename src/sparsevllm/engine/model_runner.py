@@ -332,11 +332,15 @@ class ModelRunner:
         3. 返回准备好的张量供 run_model 使用
         """
         input_ids, positions, cu_seqlens_q = self.cache_manager.prepare_step(seqs, is_prefill) # 同时内部设置buffer_req_to_token_slots，row_seq_lens，slot_mapping(slot_mapping保存在layer_batch_state中)
+        prefill_is_last_chunk = None
+        if is_prefill:
+            prefill_is_last_chunk = [bool(seq.is_last_chunk_prefill) for seq in seqs]
         set_context(
             is_prefill,
             cu_seqlens_q=cu_seqlens_q,
             cache_manager=self.cache_manager,
             is_long_text=self._is_long_text_batch(seqs, is_prefill),
+            prefill_is_last_chunk=prefill_is_last_chunk,
         )
         return input_ids, positions
 

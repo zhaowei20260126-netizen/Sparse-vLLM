@@ -392,6 +392,7 @@ class CacheManager(ABC):
         *,
         num_heads: int,
         num_kv_heads: int,
+        prefill_is_last_chunk: list[bool] | None = None,
     ) -> None:
         """Optional prefill-time attention observer.
 

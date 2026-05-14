@@ -216,6 +216,7 @@ class Attention(nn.Module):
                     context.cu_seqlens_q,
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
+                    prefill_is_last_chunk=context.prefill_is_last_chunk,
                 )
 
                 # Triton 路径需要物理槽位 layer_active_slots 用于 Req_to_tokens 寻址

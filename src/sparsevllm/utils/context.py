@@ -7,6 +7,7 @@ class Context:
         self.cache_manager = None
         self.sparse_controller = None
         self.sparse_config = None
+        self.prefill_is_last_chunk = None
 
 
 _CONTEXT = Context()
@@ -16,13 +17,20 @@ def get_context():
     return _CONTEXT
 
 
-def set_context(is_prefill, cu_seqlens_q=None, cache_manager=None, is_long_text=False):
+def set_context(
+    is_prefill,
+    cu_seqlens_q=None,
+    cache_manager=None,
+    is_long_text=False,
+    prefill_is_last_chunk=None,
+):
     global _CONTEXT
     _CONTEXT.is_prefill = is_prefill
     _CONTEXT.is_long_text = is_long_text
     _CONTEXT.cu_seqlens_q = cu_seqlens_q
     _CONTEXT.now_layer_idx = 0
     _CONTEXT.cache_manager = cache_manager
+    _CONTEXT.prefill_is_last_chunk = prefill_is_last_chunk
 
 def reset_context():
     global _CONTEXT

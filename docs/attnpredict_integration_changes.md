@@ -86,7 +86,7 @@ self.cnn: AttnPredictCNN                          # 全层共享的 CNN 预测�
 
 | 方法 | 功能 |
 |------|------|
-| `observe_prefill_attention(...)` | prefill 后取最后 64 个 query 计算 attention history，并预测首个 decode mask |
+| `observe_prefill_attention(...)` | 非最后 prefill chunk 跳过；最后 chunk 取末尾 64 个 query 并预测首个 decode mask |
 | `build_decode_view(...)` | 根据上一轮 `tsp_mask` pack selected slots，并强制保留当前 decode 新 token |
 | `predict_next_mask(layer_idx, attn_logits)` | 将 raw logits 转 softmax，必要时 scatter 回完整逻辑序列，再预测下一步 mask |
 | `_update_attn_history(...)` | 维护每个 cache row 的 64 步滚动窗口 |
@@ -98,8 +98,9 @@ self.cnn: AttnPredictCNN                          # 全层共享的 CNN 预测�
 ```
 Prefill:
   1. 写入完整 K/V 到 GPU cache
-  2. observe_prefill_attention() 计算最后 64 个 query 的 attention softmax
-  3. max-pool → 更新 attn_history → CNN 预测 → 生成首个 decode mask
+  2. 非最后 prefill chunk 跳过 AttentionPredictor 建模
+  3. 最后一个 prefill chunk 取末尾 64 个 query 的 attention softmax
+  4. 更新 attn_history → CNN 预测 → 生成首个 decode mask
 
 Decode Step t:
   1. build_decode_view() 使用 step t-1 的 mask pack slots
@@ -132,7 +133,7 @@ Decode Step t:
 | `attnpredict_pooling_block_size` | `int` | `16` | max pooling 的 block 大小 |
 | `attnpredict_model_path` | `str` | `""` | CNN checkpoint 路径 |
 
-AttentionPredictor 的 token 预算复用通用稀疏配置：`num_top_tokens`、`num_sink_tokens`、`num_recent_tokens`。
+AttentionPredictor 的 token 预算复用通用稀疏配置：`num_top_tokens`、`num_sink_tokens`、`num_recent_tokens`。其中 `num_top_tokens` 对齐原始 AttentionPredictor 的 `topk` 总预算，包含 sink 和 recent/local token；CNN 额外选择的中间区域预算为 `num_top_tokens - num_sink_tokens - num_recent_tokens`。
 
 **`vllm_sparse_method` 文档**: 添加 `"attnpredict"` 到可选值列表。
 

@@ -78,18 +78,25 @@ class AttnPredictCacheManager(StandardCacheManager):
         *,
         num_heads: int,
         num_kv_heads: int,
+        prefill_is_last_chunk: list[bool] | None = None,
     ) -> None:
-        """Prefill 阶段：用最后 history_step 个 query 计算 attention，初始化 CNN 历史。
+        """Prefill 阶段：只在最后一个 chunk 用尾部 query 初始化 CNN 历史。
 
-        这样首个 decode step 就能使用预测 mask，不需要等到积累够 history_step 步。
+        当前假设 chunk 大小大于 history_step；非最后 chunk 直接跳过，最后
+        chunk 取末尾 history_step 个 query 生成首个 decode step 可用的 mask。
         """
         if cu_seqlens_q is None or cu_seqlens_q.numel() <= 1:
+            return
+        if prefill_is_last_chunk is None:
             return
 
         with profiler.record("attnpredict_observe_prefill_attention"):
             group_size = max(1, num_heads // max(1, num_kv_heads))
             batch_size = int(req_indices.numel())
             for b in range(batch_size):
+                if not prefill_is_last_chunk[b]:
+                    continue
+
                 q_end = int(cu_seqlens_q[b + 1].item())
                 q_start = int(cu_seqlens_q[b].item())
                 q_len = q_end - q_start
@@ -415,8 +422,10 @@ class AttnPredictCacheManager(StandardCacheManager):
         if pred_len < 1:
             return keep_mask
 
-        # 计算可选的 block 预算
-        block_budget = self.topk // self.pooling_block_size
+        # 与原始 AttentionPredictor 语义对齐：topk 是总保留预算，
+        # CNN 额外选择的中间区域预算需要排除 sink/local。
+        middle_budget = self.topk - self.sink_token - self.local_token
+        block_budget = middle_budget // self.pooling_block_size
         block_budget = max(0, min(block_budget, pred_len))
         if block_budget <= 0:
             return keep_mask
