@@ -39,7 +39,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         """初始化 GPU active pool、CPU full backing、predictor 和异步预取资源。"""
         CacheManager.__init__(self, config, rank, world_size)
         assert world_size == 1, "attnpredict-offload currently supports tensor_parallel_size=1." # TODO 为什么无法支持world_size >1 的例子
-
+        # 分配 GPU active KV pool 和 CPU full KV backing
         self.allocate_kv_cache()
 
         # ------------------------------------------------------------------
@@ -52,7 +52,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         self.free_slots_stack: list[list[int]] = [list(range(num_slots)) for _ in range(self.num_layers)]
         self._num_free_slots = [num_slots for _ in range(self.num_layers)]
 
-        # GPU 侧 row/pos -> slot 映射。decode kernel 会用它把逻辑 token 位置映射到
+        # GPU 侧 row -> slot 映射。decode kernel 会用它把逻辑 token 位置映射到
         # 实际 GPU KV slot。值为 -1 表示这个 token 当前不在 GPU 上。
         self.buffer_req_to_token_slots = [
             torch.full((self.max_buffer_rows, self.max_model_len), -1, dtype=torch.int32, device="cuda")
@@ -79,7 +79,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         # ------------------------------------------------------------------
         # CPU full KV backing 元数据
         # ------------------------------------------------------------------
-        # CPU 侧 row/pos -> cpu_slot 映射。只要 token 进入过 KV cache，这里就应该能找到
+        # CPU 侧 row -> cpu_slot 映射。只要 token 进入过 KV cache，这里就应该能找到
         # 它完整 K/V 在 CPU full backing 中的位置。
         self.cpu_req_to_token_slots = np.full(
             (self.max_buffer_rows, self.max_model_len),
@@ -102,8 +102,9 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         # build_decode_view() 再把它转换成 packed GPU slots 交给 decode kernel。
         self._decode_view_positions: list[list[np.ndarray] | None] = [None for _ in range(self.num_layers)]
 
+        # TODO 这一部分在attentionpredict.py里也有,直接继承不行吗？
         # ------------------------------------------------------------------
-        # AttentionPredictor 状态
+        # AttentionPredictor 状态 
         # ------------------------------------------------------------------
         # topk/sink/local/pooling 等语义沿用原始 AttentionPredictor。
         # tsp_mask[layer][row] 保存该层该序列下一步应该保留哪些 token。
@@ -182,8 +183,6 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         # CPU full KV backing。布局和 GPU kv_cache 保持一致：
         #   cpu_kv_cache[0, layer, slot] 是 K
         #   cpu_kv_cache[1, layer, slot] 是 V
-        # CPU slot 本身不区分 K/V，只表示某个逻辑 token 在所有层 full backing
-        # 中的共同位置，K/V 由第 0 维区分。
         self.cpu_num_slots = self._compute_cpu_num_slots()
         self.cpu_kv_cache = torch.empty(
             2,
