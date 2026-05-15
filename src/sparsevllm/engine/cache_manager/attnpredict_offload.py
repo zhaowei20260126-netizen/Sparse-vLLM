@@ -16,7 +16,6 @@ from sparsevllm.utils.log import logger
 from sparsevllm.utils.profiler import profiler
 
 from .attnpredict import AttnPredictCacheManager
-from .attnpredict_cnn import AttnPredictCNN
 from .base import CacheManager, LayerBatchStates
 
 
@@ -102,31 +101,10 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         # build_decode_view() 再把它转换成 packed GPU slots 交给 decode kernel。
         self._decode_view_positions: list[list[np.ndarray] | None] = [None for _ in range(self.num_layers)]
 
-        # TODO 这一部分在attentionpredict.py里也有,直接继承不行吗？
-        # ------------------------------------------------------------------
-        # AttentionPredictor 状态 
-        # ------------------------------------------------------------------
-        # topk/sink/local/pooling 等语义沿用原始 AttentionPredictor。
-        # tsp_mask[layer][row] 保存该层该序列下一步应该保留哪些 token。
-        self.topk = int(config.num_top_tokens)
-        self.history_step = int(config.attnpredict_history_steps)
-        self.pooling_block_size = int(config.attnpredict_pooling_block_size)
-        self.sink_token = int(config.num_sink_tokens)
-        self.local_token = int(config.num_recent_tokens)
-        self.attn_scale = self.head_dim ** -0.5
-        self.attn_history: list[dict[int, torch.Tensor]] = [{} for _ in range(self.num_layers)]
-        self.tsp_mask: list[dict[int, torch.Tensor]] = [{} for _ in range(self.num_layers)]
-        self._last_decode_view: list[dict[str, torch.Tensor | None] | None] = [
-            None for _ in range(self.num_layers)
-        ]
-
-        # CNN predictor 与 attnpredict 原实现共用结构和 checkpoint。
-        self.cnn = AttnPredictCNN()
-        state_dict = torch.load(str(config.attnpredict_model_path), map_location="cuda", weights_only=False)
-        self.cnn.load_state_dict(state_dict)
-        self.cnn.to(dtype=torch.float16, device="cuda")
-        self.cnn.eval()
-        self.cnn_dtype = next(self.cnn.parameters()).dtype
+        # AttentionPredictor 算法状态与普通 attnpredict 完全一致，复用父类 helper。
+        # 注意这里不能调用 AttnPredictCacheManager.__init__()，否则会同时初始化
+        # StandardCacheManager 的全局 GPU slot 结构，和 offload 的 per-layer active pool 冲突。
+        self._init_attnpredictor_state(config)
 
         # ------------------------------------------------------------------
         # 异步预取资源

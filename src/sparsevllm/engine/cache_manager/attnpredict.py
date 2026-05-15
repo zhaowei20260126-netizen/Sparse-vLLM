@@ -20,7 +20,15 @@ class AttnPredictCacheManager(StandardCacheManager):
 
     def __init__(self, config: Config, rank: int, world_size: int):
         super().__init__(config, rank, world_size)
+        self._init_attnpredictor_state(config)
 
+    def _init_attnpredictor_state(self, config: Config) -> None:
+        """初始化 AttentionPredictor 共享状态。
+
+        这里只包含 predictor 算法本身需要的状态：稀疏预算、滚动 attention
+        历史、每层预测 mask，以及 CNN checkpoint。它不初始化任何物理 KV
+        slot 结构，因此普通 attnpredict 和 attnpredict-offload 都可以复用。
+        """
         # ---- AttentionPredictor 超参 ----
         self.topk = int(config.num_top_tokens)
         self.history_step = int(config.attnpredict_history_steps)
