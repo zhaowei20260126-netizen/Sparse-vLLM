@@ -179,29 +179,21 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
             device="cuda",
         )
 
-        # CPU full KV backing。这里每层单独分配 K/V，因为 CPU 侧保存完整历史，
-        # 需要能从任意 layer/pos 恢复到 GPU active pool。
+        # CPU full KV backing。布局和 GPU kv_cache 保持一致：
+        #   cpu_kv_cache[0, layer, slot] 是 K
+        #   cpu_kv_cache[1, layer, slot] 是 V
+        # CPU slot 本身不区分 K/V，只表示某个逻辑 token 在所有层 full backing
+        # 中的共同位置，K/V 由第 0 维区分。
         self.cpu_num_slots = self._compute_cpu_num_slots()
-        self.cpu_k_cache = [
-            torch.empty(
-                self.cpu_num_slots,
-                self.num_kv_heads,
-                self.head_dim,
-                dtype=self.hf_config.torch_dtype,
-                device="cpu",
-            )
-            for _ in range(self.num_layers)
-        ]
-        self.cpu_v_cache = [
-            torch.empty(
-                self.cpu_num_slots,
-                self.num_kv_heads,
-                self.head_dim,
-                dtype=self.hf_config.torch_dtype,
-                device="cpu",
-            )
-            for _ in range(self.num_layers)
-        ] # TODO cpu_k_cache 和 cpu_v_cache 应该参照gpu端的kv_cache，将其合并为一个，在第0维度标记是k还是v，这样在分配cpu slot时就不需要区分是k还是v了，减少出错概率
+        self.cpu_kv_cache = torch.empty(
+            2,
+            self.num_layers,
+            self.cpu_num_slots,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=self.hf_config.torch_dtype,
+            device="cpu",
+        )
 
     def _compute_cpu_num_slots(self) -> int:
         """计算 CPU full backing 可以容纳多少 token slot。
@@ -209,7 +201,8 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         如果用户配置 attnpredict_offload_cpu_slots > 0，就完全尊重用户配置。
         否则自动估算：
         1. 目标值先取 max_model_len * max_num_seqs_in_batch。
-        2. 再根据系统可用 CPU 内存的 70% 估算最多能放多少完整 KV。
+        2. 再根据系统可用 CPU 内存和 attnpredict_offload_cpu_memory_utilization
+           估算最多能放多少完整 KV。
         3. 取二者较小值，避免默认情况下把 CPU 内存吃满。
         """
         explicit = int(getattr(self.config, "attnpredict_offload_cpu_slots", -1) or -1)
@@ -227,8 +220,9 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         desired = int(self.max_model_len) * int(max(1, self.config.max_num_seqs_in_batch))# TODO 这里是不是应该受限于gpu利用率，即一次前向传播最大能允许多少个token，而不是max_model_len
         mem_available = self._cpu_mem_available_bytes()
         if mem_available > 0 and bytes_per_slot_all_layers > 0:
-            # 只用可用内存的 70% 做预算，给系统、dataloader、Python 对象等留余量。
-            by_mem = int((mem_available * 0.70) // bytes_per_slot_all_layers) # TODO 为什么要乘以0.7，是cpu利用率吗？如果是应该将其改成一个参数，而不是写死
+            # 只用可用内存的一部分做预算，给系统、dataloader、Python 对象等留余量。
+            cpu_mem_ratio = float(self.config.attnpredict_offload_cpu_memory_utilization)
+            by_mem = int((mem_available * cpu_mem_ratio) // bytes_per_slot_all_layers)
             desired = min(desired, max(1, by_mem))
         return max(1, desired)
 
@@ -336,7 +330,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         """为某个序列的新 token 分配 CPU full backing slots。
 
         CPU slot 是跨层共享的逻辑 token slot：同一个 cpu_slot 在每一层的
-        cpu_k_cache[layer]/cpu_v_cache[layer] 中保存该 token 对应层的 KV。
+        cpu_kv_cache[0/1, layer, slot] 中保存该 token 对应层的 K/V。
         """
         if self._num_free_cpu_slots < size:
             raise RuntimeError(
@@ -420,8 +414,8 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         with profiler.record("attnpredict_offload_cpu_gather_background"):
             # CPU gather：这里仍在 CPU 上做 index_select，避免先把完整 CPU cache 搬上 GPU。
             cpu_idx = torch.tensor(cpu_slots, dtype=torch.long, device="cpu")
-            host_k = self.cpu_k_cache[layer_idx].index_select(0, cpu_idx)
-            host_v = self.cpu_v_cache[layer_idx].index_select(0, cpu_idx)
+            host_k = self.cpu_kv_cache[0, layer_idx].index_select(0, cpu_idx)
+            host_v = self.cpu_kv_cache[1, layer_idx].index_select(0, cpu_idx)
             if self._pin_staging:
                 # pinned memory 是异步 H2D 的常见 staging 区。这里多一次 CPU copy，
                 # 换取后续 host_k.to("cuda", non_blocking=True) 更容易异步执行。
@@ -668,8 +662,8 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
             cpu_slots = torch.tensor(cpu_slots_np, dtype=torch.long, device="cpu")
             host_k = k.detach().to(device="cpu", dtype=self.hf_config.torch_dtype)
             host_v = v.detach().to(device="cpu", dtype=self.hf_config.torch_dtype)
-            self.cpu_k_cache[layer_idx].index_copy_(0, cpu_slots, host_k)
-            self.cpu_v_cache[layer_idx].index_copy_(0, cpu_slots, host_v)
+            self.cpu_kv_cache[0, layer_idx].index_copy_(0, cpu_slots, host_k)
+            self.cpu_kv_cache[1, layer_idx].index_copy_(0, cpu_slots, host_v)
 
     def build_decode_view(
         self,

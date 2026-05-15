@@ -50,6 +50,7 @@ class Config:
     attnpredict_offload_prefetch: bool = True
     attnpredict_offload_cpu_threads: int = 8
     attnpredict_offload_cpu_slots: int = -1
+    attnpredict_offload_cpu_memory_utilization: float = 0.70
     attnpredict_offload_pin_staging: bool = True
 
     # SnapKV Config
@@ -197,6 +198,13 @@ class Config:
                     raise ValueError("attnpredict_offload_cpu_threads 必须 >= 1")
                 if self.attnpredict_offload_cpu_slots == 0 or self.attnpredict_offload_cpu_slots < -1:
                     raise ValueError("attnpredict_offload_cpu_slots 必须为 -1 或正整数")
+                try:
+                    cpu_mem_util = float(self.attnpredict_offload_cpu_memory_utilization)
+                except (TypeError, ValueError) as e:
+                    raise ValueError("attnpredict_offload_cpu_memory_utilization 必须是 (0, 1] 范围内的数字") from e
+                if not (0 < cpu_mem_util <= 1):
+                    raise ValueError("attnpredict_offload_cpu_memory_utilization 必须在 (0, 1] 范围内")
+                self.attnpredict_offload_cpu_memory_utilization = cpu_mem_util
 
         # Normalize compressor type strings.
         for attr in ("compressor_down_type", "compressor_up_type"):
