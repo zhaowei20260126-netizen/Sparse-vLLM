@@ -82,8 +82,8 @@ class AttnPredictCacheManager(StandardCacheManager):
     ) -> None:
         """Prefill 阶段：只在最后一个 chunk 用尾部 query 初始化 CNN 历史。
 
-        当前假设 chunk 大小大于 history_step；非最后 chunk 直接跳过，最后
-        chunk 取末尾 history_step 个 query 生成首个 decode step 可用的 mask。
+        当前假设 最后一个chunk 大小大于 history_step；非最后 chunk 直接跳过，最后
+        chunk 取末尾 history_step 个 query 生成首个 decode step 可用的 mask。 TODO： 如果最后一个chunk 小于 history_step,需要利用到上一个chunk的 query 来补齐历史窗口
         """
         if cu_seqlens_q is None or cu_seqlens_q.numel() <= 1:
             return
@@ -110,7 +110,7 @@ class AttnPredictCacheManager(StandardCacheManager):
                 row_idx = int(req_indices[b].item())
                 # 取当前序列最后 history_step 个 query token
                 take = min(self.history_step, q_len)
-                q_tail = q[q_end - take:q_end].to(torch.float32)
+                q_tail = q[q_end - take:q_end].to(torch.float32) #[64,32,128]
 
                 # 从 GPU KV cache 中按 slot 取出完整 K 序列
                 slots = active_slots[row_idx, :full_len].to(torch.long)
@@ -343,7 +343,7 @@ class AttnPredictCacheManager(StandardCacheManager):
 
         if attn_history is None:
             # 首次记录：不足 history_step 则在前面 pad 0
-            if attn_pooling.shape[-2] < self.history_step:
+            if attn_pooling.shape[-2] < self.history_step: # 如果最后一个chunk 的大小小于 history_step, 则在前面 pad 0。或者本省q总数小于 history_step
                 pad_rows = self.history_step - attn_pooling.shape[-2]
                 attn_pooling = F.pad(attn_pooling, (0, 0, pad_rows, 0))
             return attn_pooling

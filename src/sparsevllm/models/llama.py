@@ -163,7 +163,7 @@ class LlamaModel(nn.Module):
         residual = None
         context = get_context()
         for i, layer in enumerate(self.layers):
-            context.now_layer_idx = i
+            context.now_layer_idx = i # TODO 前两层ATTNPRDICT不需要预测
             hidden_states, residual = layer(positions, hidden_states, residual)
             if self.sparse_controller is not None:
                 self.sparse_controller.on_layer_end(i, context)

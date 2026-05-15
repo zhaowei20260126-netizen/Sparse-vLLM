@@ -228,10 +228,22 @@ class Attention(nn.Module):
                     layer_active_slots,      # ★ 决定实际读哪些物理 slot
                     attn_score=layer_attn_score,  # ★ 收集注意力分数到 attn_score 张量
                 )
-            else:    # decode
-                # 让 cache manager 决定本层看哪些 KV
-                batch_size = q.shape[0]
-                layer_active_slots, b_req_idx, layer_context_lens = cache_manager.build_decode_view(
+            else:    # decode ,
+                # cache manager 决定本层看哪些 KV
+                batch_size = q.shape[0] # q: [batch_size, num_heads, head_dim]
+                # 返回本层实际要读的 KV 位置
+                '''
+                layer_active_slots: [batch_size , visible_len]
+                每个序列本轮 attention 要读的物理 KV slot id
+
+                b_req_idx:
+                kernel 读 layer_active_slots 时用的行索引
+
+                layer_context_lens: [batch_size]
+                每个序列本轮实际可见的 KV 长度
+
+                '''
+                layer_active_slots, b_req_idx, layer_context_lens = cache_manager.build_decode_view( 
                     context.now_layer_idx,
                     q,
                     layer_active_slots,
@@ -240,24 +252,37 @@ class Attention(nn.Module):
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
                 )
-
+                # 算本 batch 里最长的可见 KV 长度
                 max_len_in_batch = layer_context_lens.max().item()
-                BLOCK_SEQ = 256
-
-                mid_o = torch.empty(
+                BLOCK_SEQ = 256 # decode kernel 会把 KV 序列按块处理，每块 256 个 token
+                # mid_o 存每个 KV block 算出来的局部 attention 输出
+                #  [batch_size, num_heads, num_blocks, head_dim]
+                mid_o = torch.empty( 
                     (batch_size, self.num_heads, (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ, self.head_dim),
                     dtype=torch.float32,
                     device=q.device,
                 )
+                # 存每个 block 的 softmax 归一化信息。因为 FlashAttention 是分块算的，最后要把各个 block 的结果合并成全局 softmax 结果，就需要这些中间统计量。
                 mid_o_logexpsum = torch.empty(
                     (batch_size, self.num_heads, (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ),
                     dtype=torch.float32,
                     device=q.device,
                 )
-
+                # 判断是 GQA 还是 MHA
                 is_gqa = self.num_heads > self.num_kv_heads
+                '''
+                stage1: 没有得到最终 o，只是每个 block 的中间结果
+                    对每个序列
+                        对每个 head
+                            把历史 KV 按 256 token 一块切开
+                            当前 q 分别和每个 block 的 K 做 QK
+                            对每个 block 局部算 softmax 相关统计
+                            算出这个 block 对 V 的局部输出
+                            写入 mid_o 和 mid_o_logexpsum
+                '''
                 if layer_attn_score is not None:
                     if is_gqa:
+                        # 该版本除了算 attention，还会把 attention logits 写到 layer_attn_score,给给 attnpredict等 后续预测下一步 mask 用
                         gqa_flash_decode_stage1_with_score(
                             q, k_cache, v_cache, layer_active_slots, b_req_idx, layer_context_lens,
                             max_len_in_batch, mid_o, mid_o_logexpsum, layer_attn_score, BLOCK_SEQ,
@@ -280,6 +305,7 @@ class Attention(nn.Module):
                         )
 
                 o = torch.empty_like(q)
+                # stage2 会把 mid_o 里每个 block 的局部输出合并起来，得到真正的 attention 输出：
                 flash_decode_stage2(mid_o, mid_o_logexpsum, layer_context_lens, o, BLOCK_SEQ)
 
             sparse_controller.on_attention_end(context.now_layer_idx, context)
