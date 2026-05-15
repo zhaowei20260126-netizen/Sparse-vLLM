@@ -38,7 +38,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
     def __init__(self, config: Config, rank: int, world_size: int):
         """初始化 GPU active pool、CPU full backing、predictor 和异步预取资源。"""
         CacheManager.__init__(self, config, rank, world_size)
-        assert world_size == 1, "attnpredict-offload currently supports tensor_parallel_size=1."
+        assert world_size == 1, "attnpredict-offload currently supports tensor_parallel_size=1." # TODO 为什么无法支持world_size >1 的例子
 
         self.allocate_kv_cache()
 
@@ -201,7 +201,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
                 device="cpu",
             )
             for _ in range(self.num_layers)
-        ]
+        ] # TODO cpu_k_cache 和 cpu_v_cache 应该参照gpu端的kv_cache，将其合并为一个，在第0维度标记是k还是v，这样在分配cpu slot时就不需要区分是k还是v了，减少出错概率
 
     def _compute_cpu_num_slots(self) -> int:
         """计算 CPU full backing 可以容纳多少 token slot。
@@ -224,11 +224,11 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         )
 
         # 理想情况下至少能容纳一个最大 batch 中所有序列的完整上下文。
-        desired = int(self.max_model_len) * int(max(1, self.config.max_num_seqs_in_batch))
+        desired = int(self.max_model_len) * int(max(1, self.config.max_num_seqs_in_batch))# TODO 这里是不是应该受限于gpu利用率，即一次前向传播最大能允许多少个token，而不是max_model_len
         mem_available = self._cpu_mem_available_bytes()
         if mem_available > 0 and bytes_per_slot_all_layers > 0:
             # 只用可用内存的 70% 做预算，给系统、dataloader、Python 对象等留余量。
-            by_mem = int((mem_available * 0.70) // bytes_per_slot_all_layers)
+            by_mem = int((mem_available * 0.70) // bytes_per_slot_all_layers) # TODO 为什么要乘以0.7，是cpu利用率吗？如果是应该将其改成一个参数，而不是写死
             desired = min(desired, max(1, by_mem))
         return max(1, desired)
 
