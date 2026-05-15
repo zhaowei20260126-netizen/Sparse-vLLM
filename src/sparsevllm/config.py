@@ -25,7 +25,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "deltakv-standalone", "deltakv-snapkv", "pyramidkv", "dsa", "attnpredict"
+    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "deltakv-standalone", "deltakv-snapkv", "pyramidkv", "dsa", "attnpredict", "attnpredict-offload"
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -47,6 +47,10 @@ class Config:
     attnpredict_history_steps: int = 64
     attnpredict_pooling_block_size: int = 16
     attnpredict_model_path: str = ""
+    attnpredict_offload_prefetch: bool = True
+    attnpredict_offload_cpu_threads: int = 8
+    attnpredict_offload_cpu_slots: int = -1
+    attnpredict_offload_pin_staging: bool = True
 
     # SnapKV Config
     snapkv_window_size: int = 32
@@ -120,6 +124,8 @@ class Config:
             self.vllm_sparse_method = ""
         elif self.vllm_sparse_method in ("attention-sink", "attention_sink"):
             self.vllm_sparse_method = "streamingllm"
+        elif self.vllm_sparse_method in ("attentionpredictor-offload", "attenpredictor-offload"):
+            self.vllm_sparse_method = "attnpredict-offload"
         
         if self.num_top_tokens_in_prefill is None:
             self.num_top_tokens_in_prefill = self.num_top_tokens
@@ -173,9 +179,9 @@ class Config:
             raise ValueError("quest_token_budget 必须 > 0")
         if self.quest_skip_layers < 0:
             raise ValueError("quest_skip_layers 不能 < 0")
-        if self.vllm_sparse_method == "attnpredict":
+        if self.vllm_sparse_method in ("attnpredict", "attnpredict-offload"):
             if not self.attnpredict_model_path:
-                raise ValueError("vllm_sparse_method='attnpredict' 需要设置 attnpredict_model_path")
+                raise ValueError(f"vllm_sparse_method={self.vllm_sparse_method!r} 需要设置 attnpredict_model_path")
             if not os.path.isfile(self.attnpredict_model_path):
                 raise FileNotFoundError(f"attnpredict_model_path 不存在: {self.attnpredict_model_path}")
             if int(self.num_top_tokens) <= 0:
@@ -186,6 +192,11 @@ class Config:
                 raise ValueError("attnpredict_history_steps 必须 > 0")
             if self.attnpredict_pooling_block_size <= 0:
                 raise ValueError("attnpredict_pooling_block_size 必须 > 0")
+            if self.vllm_sparse_method == "attnpredict-offload":
+                if self.attnpredict_offload_cpu_threads < 1:
+                    raise ValueError("attnpredict_offload_cpu_threads 必须 >= 1")
+                if self.attnpredict_offload_cpu_slots == 0 or self.attnpredict_offload_cpu_slots < -1:
+                    raise ValueError("attnpredict_offload_cpu_slots 必须为 -1 或正整数")
 
         # Normalize compressor type strings.
         for attr in ("compressor_down_type", "compressor_up_type"):

@@ -154,6 +154,10 @@ class CacheManager(ABC):
             from .attnpredict import AttnPredictCacheManager
 
             return AttnPredictCacheManager(config, rank, world_size)
+        if sparse_method == "attnpredict-offload":
+            from .attnpredict_offload import AttnPredictOffloadCacheManager
+
+            return AttnPredictOffloadCacheManager(config, rank, world_size)
         if sparse_method == "quest":
             from .quest import QuestCacheManager
 
@@ -367,7 +371,13 @@ class CacheManager(ABC):
     #     子类可覆写以接入自定义逻辑。
     # =========================================================================
 
-    def on_kv_stored(self, layer_idx: int, k: torch.Tensor, slot_mapping: torch.Tensor):
+    def on_kv_stored(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        v: torch.Tensor | None = None,
+    ):
         """KV 写入物理缓存后的方法特定 Hook。
 
         在 Attention.forward 中 store_kvcache() 执行完毕后立即调用。

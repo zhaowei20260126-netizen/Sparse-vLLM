@@ -255,7 +255,13 @@ class QuestCacheManager(CacheManager):
             return input_ids, positions, None
 
     @torch.no_grad()
-    def on_kv_stored(self, layer_idx: int, k: torch.Tensor, slot_mapping: torch.Tensor):
+    def on_kv_stored(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        v: torch.Tensor | None = None,
+    ):
         if slot_mapping is None or slot_mapping.numel() == 0:
             return
 

@@ -37,6 +37,7 @@ class SparseController:
         self.is_deltakv_standalone = self.sparse_method == 'deltakv-standalone'
         self.is_deltakv_snapkv = self.sparse_method == 'deltakv-snapkv'
         self.is_deltakv_standalone_like = self.sparse_method in ('deltakv-standalone', 'deltakv-snapkv')
+        self.is_attnpredict_family = self.sparse_method in ('attnpredict', 'attnpredict-offload')
         
         self.config = config
         self.cache_manager = cache_manager
@@ -203,8 +204,8 @@ class SparseController:
         """
         sparse_state = self.layer_batch_sparse_states[layer_idx]
         # TODO attnpredict每层都需要预测吧？
-        if (self.sparse_method in ("omnikv", "deltakv", "attnpredict") and layer_idx in self.full_attn_layers) or \
-            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', 'streamingllm', 'attention-sink', 'attention_sink', 'attnpredict', ''):
+        if (self.sparse_method in ("omnikv", "deltakv", "attnpredict", "attnpredict-offload") and layer_idx in self.full_attn_layers) or \
+            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', 'streamingllm', 'attention-sink', 'attention_sink', 'attnpredict', 'attnpredict-offload', ''):
 
             return (
                 self.cache_manager.get_layer_buffer_req_to_token_slots(layer_idx),  # 全部 token slots
@@ -322,6 +323,23 @@ class SparseController:
             assert len(target_layers) > 0
 
             self._update_dynamic_omnikv_indices(layer_idx, target_layers)
+
+    def on_attention_end(self, layer_idx: int, context):
+        """Attention kernel 完成后的轻量回调。
+
+        attnpredict-offload 需要在 attention logits 写完后尽早提交后台预测和
+        CPU->GPU 预取，这个时机早于 model layer 的 MLP 结束。
+        """
+        if self.sparse_method != 'attnpredict-offload':
+            return
+
+        if context.is_prefill:
+            self.cache_manager.on_prefill_layer_end(layer_idx)
+            return
+
+        state = self.layer_batch_sparse_states[layer_idx]
+        if state.attn_score is not None:
+            self.cache_manager.predict_next_mask(layer_idx, state.attn_score)
 
     @torch.no_grad()
     def _deltakv_eviction(self, seqs: list[Sequence]):
@@ -609,7 +627,7 @@ class SparseController:
         # =====================================================================
         # decode 时每层都收集 attention logits，cache manager 会按原始实现转成 softmax 权重。
         # prefill 不需要（不做预测，全量 attention）。
-        if self.sparse_method == 'attnpredict':
+        if self.sparse_method in ('attnpredict', 'attnpredict-offload'):
             return not is_prefill
 
         if self.sparse_method == 'deltakv-snapkv':

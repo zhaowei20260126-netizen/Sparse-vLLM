@@ -104,6 +104,7 @@ Set `vllm_sparse_method` to one of:
 - `"omnikv"` (logical masking)
 - `"quest"` (query-aware page selection on decode; prefill stays full attention)
 - `"attnpredict"` (AttentionPredictor-style temporal attention prediction; full KV remains on GPU)
+- `"attnpredict-offload"` (AttentionPredictor with GPU active KV pool + CPU full KV backing)
 - `"deltakv"` / `"deltakv-*"` (hybrid compression; optional / experimental, see [DeltaKV](#deltakv))
 
 `quest` runtime knobs:
@@ -117,7 +118,12 @@ Set `vllm_sparse_method` to one of:
 - `attnpredict_model_path`: CNN checkpoint path (required)
 - `attnpredict_history_steps`: rolling attention history rows (default `64`)
 - `attnpredict_pooling_block_size`: token block size for max pooling (default `16`)
-- Uses the common sparse budget knobs: `num_top_tokens`, `num_sink_tokens`, and `num_recent_tokens`
+- `attnpredict_offload_prefetch`: for `attnpredict-offload`, run prediction and CPU→GPU KV prefetch on background work/stream (default `True`)
+- `attnpredict_offload_cpu_threads`: CPU worker threads for offload gather/prefetch (default `8`)
+- `attnpredict_offload_cpu_slots`: CPU full-KV slot capacity; `-1` estimates from available memory (default `-1`)
+- `attnpredict_offload_pin_staging`: use pinned CPU staging buffers for async H2D prefetch (default `True`)
+- Uses the common sparse budget knobs: `num_top_tokens`, `num_sink_tokens`, and `num_recent_tokens`.
+  For `attnpredict`, `num_top_tokens` follows the original AttentionPredictor `topk` semantics: it is the total keep budget, including sink and recent tokens.
 
 ## How to test
 

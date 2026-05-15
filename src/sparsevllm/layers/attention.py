@@ -180,7 +180,7 @@ class Attention(nn.Module):
         # 1. 写入 KV Cache (物理行为)
         # 无论是 DeltaKV 还是全量/SnapKV，均先将当前 KV 写入物理槽位 (对于 DeltaKV，是写入 Base Pool 作为 Recent)
         store_kvcache(k, v, store_k_cache, store_v_cache, slot_mapping)
-        cache_manager.on_kv_stored(context.now_layer_idx, k, slot_mapping) # 默认空操作。只有 QuEST 覆写了这个方法，用于在 KV 写入后更新 page 的 max/min 元数据缓存。
+        cache_manager.on_kv_stored(context.now_layer_idx, k, slot_mapping, v=v) # 默认空操作。QuEST 用于更新元数据；offload 方法可同步保存 V。
 
         # 2. 获取逻辑视图
         layer_active_slots, layer_active_indices, layer_req_indices, layer_context_lens, layer_attn_score, deltakv_temp_slots = \
@@ -229,6 +229,7 @@ class Attention(nn.Module):
                     attn_score=layer_attn_score,  # ★ 收集注意力分数到 attn_score 张量
                 )
             else:    # decode
+                # 让 cache manager 决定本层看哪些 KV
                 batch_size = q.shape[0]
                 layer_active_slots, b_req_idx, layer_context_lens = cache_manager.build_decode_view(
                     context.now_layer_idx,
@@ -281,6 +282,7 @@ class Attention(nn.Module):
                 o = torch.empty_like(q)
                 flash_decode_stage2(mid_o, mid_o_logexpsum, layer_context_lens, o, BLOCK_SEQ)
 
+            sparse_controller.on_attention_end(context.now_layer_idx, context)
             return o
         finally:
             # DeltaKV reconstructs some KV into scratch slots; recycle them immediately after use.
