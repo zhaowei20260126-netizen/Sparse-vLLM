@@ -342,7 +342,7 @@ class AttnPredictCacheManager(StandardCacheManager):
         """滚动更新 attention 历史窗口。
 
         每步将新 attention（max-pooling 后）追加到历史末尾，截断至 history_step 行。
-        序列长度变化时自动 padding/截断以对齐列数。
+        decode 长度只会增长，因此只需要在 block 数增加时 padding 旧历史。
         """
         # 先做 block 级 max-pooling，再截取尾部
         attn_pooling = self._max_pooling(attn_weights_full)
@@ -361,8 +361,6 @@ class AttnPredictCacheManager(StandardCacheManager):
         new_len = int(attn_pooling.shape[-1])
         if new_len > old_len:
             attn_history = F.pad(attn_history, (0, new_len - old_len))
-        elif new_len < old_len:
-            attn_history = attn_history[..., :new_len]
 
         # 拼接后保留最近 history_step 行
         hist = torch.cat([attn_history, attn_pooling], dim=-2)
