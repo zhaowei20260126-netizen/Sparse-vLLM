@@ -357,7 +357,7 @@ class AttnPredictCacheManager(StandardCacheManager):
             return attn_pooling
 
         # 对齐列数（序列长度可能随 decode 增长）
-        old_len = int(attn_history.shape[-1])
+        old_len = int(attn_history.shape[-1]) # 如shape:【32,64，625】
         new_len = int(attn_pooling.shape[-1])
         if new_len > old_len:
             attn_history = F.pad(attn_history, (0, new_len - old_len))

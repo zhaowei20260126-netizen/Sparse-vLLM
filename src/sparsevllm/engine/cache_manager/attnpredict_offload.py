@@ -538,7 +538,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
             # 但还没有本层 GPU slot；这里逐层分配。
             rows = self._decode_rows
             current_positions = self._decode_current_positions
-            current_slots = self._ensure_current_decode_slots(layer_idx, rows, current_positions)
+            current_slots = self._ensure_current_decode_slots(layer_idx, rows, current_positions) # 为当前 decode token 分配 GPU slot，并返回本层所有decode token 的 GPU slot 列表
             state.slot_mapping = torch.tensor(current_slots, dtype=torch.int32, device="cuda")
 
             # 当前 token 必须加入本层可见 view。上一轮 predictor 无法提前预测当前 token，
@@ -742,7 +742,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         for b, (row_idx, positions) in enumerate(zip(rows.tolist(), view_positions)):
             # positions 在 get_layer_store_view() 中已经确保 resident，这里只做查表和打包。
             slots = [int(mirror[int(row_idx), int(pos)]) for pos in positions.tolist()]
-            if any(slot < 0 for slot in slots):
+            if any(slot < 0 for slot in slots): #TODO:这一步是不是冗余的？
                 raise RuntimeError(f"AttnPredict offload decode view has nonresident slots at layer {layer_idx}.")
             k = len(slots)
             packed_positions[b, :k] = torch.tensor(positions, dtype=torch.int32, device=q.device)
@@ -912,7 +912,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
             # 没被看的 token 权重为 0，这样 predictor history 仍保持完整长度语义。
             pos = positions[b, :view_len].to(device=attn.device, dtype=torch.long)
             full_attn = torch.zeros((attn.shape[0], full_len), dtype=attn.dtype, device=attn.device)
-            full_attn.scatter_(1, pos.unsqueeze(0).expand(attn.shape[0], -1), attn)
+            full_attn.scatter_(1, pos.unsqueeze(0).expand(attn.shape[0], -1), attn) # 沿着第 1 维，也就是token维度，把 attn 里的值，写到 full_attn 的指定pos位置里。
 
             # 父类方法内部会做 pooling、CNN 预测、topk/sink/recent mask 生成。
             self._update_row_prediction(
