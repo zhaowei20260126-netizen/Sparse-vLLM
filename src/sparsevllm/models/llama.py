@@ -166,7 +166,7 @@ class LlamaModel(nn.Module):
             context.now_layer_idx = i # TODO 前两层ATTNPRDICT不需要预测
             hidden_states, residual = layer(positions, hidden_states, residual)
             if self.sparse_controller is not None:
-                self.sparse_controller.on_layer_end(i, context)#attenpredict-offload只有在decode阶段才会执行里面的方法
+                self.sparse_controller.on_layer_end(i, context)# attnpredict-offload 的预测逻辑不在 on_layer_end 里执行，而是在 Attention.forward 内部的 on_attention_end 更早触发。
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
