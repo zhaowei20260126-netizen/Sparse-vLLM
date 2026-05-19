@@ -58,7 +58,7 @@ class AttnPredictCacheManager(StandardCacheManager):
         self.cnn = AttnPredictCNN()
         model_path = str(config.attnpredict_model_path or "")
         state_dict = torch.load(model_path, map_location="cuda", weights_only=False)
-        self.cnn.load_state_dict(state_dict)
+        self.cnn.load_state_dict(state_dict) # cnn模型占gpu的2MB显存，很小
         self.cnn.to(dtype=torch.float16, device="cuda")
         self.cnn.eval()
         self.cnn_dtype = next(self.cnn.parameters()).dtype
@@ -88,7 +88,7 @@ class AttnPredictCacheManager(StandardCacheManager):
         num_kv_heads: int,
         prefill_is_last_chunk: list[bool] | None = None,
     ) -> None:
-        """Prefill 阶段：只在最后一个 chunk 用尾部 query 初始化 CNN 历史。
+        """Prefill 阶段：只在最后一个 chunk 用尾部 query 初始化 CNN 历史。预测第一步的掩码
 
         当前假设 最后一个chunk 大小大于 history_step；非最后 chunk 直接跳过，最后
         chunk 取末尾 history_step 个 query 生成首个 decode step 可用的 mask。 TODO： 如果最后一个chunk 小于 history_step,需要利用到上一个chunk的 query 来补齐历史窗口

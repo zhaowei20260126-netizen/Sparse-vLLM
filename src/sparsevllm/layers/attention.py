@@ -180,7 +180,7 @@ class Attention(nn.Module):
         # 1. 写入 KV Cache (物理行为)
         # 无论是 DeltaKV 还是全量/SnapKV，均先将当前 KV 写入物理槽位 (对于 DeltaKV，是写入 Base Pool 作为 Recent)
         store_kvcache(k, v, store_k_cache, store_v_cache, slot_mapping)
-        cache_manager.on_kv_stored(context.now_layer_idx, k, slot_mapping, v=v) # 默认空操作。QuEST 用于更新元数据；offload 方法可同步保存 V。
+        cache_manager.on_kv_stored(context.now_layer_idx, k, slot_mapping, v=v) # 默认空操作。QuEST 用于更新元数据；attnpredict-offload 方法可同步保存 k\v。
 
         # 2. 获取逻辑视图
         layer_active_slots, layer_active_indices, layer_req_indices, layer_context_lens, layer_attn_score, deltakv_temp_slots = \
@@ -206,7 +206,7 @@ class Attention(nn.Module):
                 b_prompt_cache_len = b_seq_len - chunk_lens        # 每个序列的历史 KV 长度
                 max_input_len = b_seq_len.max().item()
 
-                cache_manager.observe_prefill_attention(
+                cache_manager.observe_prefill_attention( #TODO:这一步还要重复计算注意力分数，为什么不可以直接利用attn_score?
                     context.now_layer_idx,
                     q,
                     k_cache,
@@ -227,7 +227,7 @@ class Attention(nn.Module):
                     b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len,
                     layer_active_slots,      # ★ 决定实际读哪些物理 slot
                     attn_score=layer_attn_score,  # ★ 收集注意力分数到 attn_score 张量
-                )
+                ) 
             else:    # decode ,
                 # cache manager 决定本层看哪些 KV
                 batch_size = q.shape[0] # q: [batch_size, num_heads, head_dim]
