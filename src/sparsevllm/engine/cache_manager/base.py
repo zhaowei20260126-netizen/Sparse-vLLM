@@ -390,7 +390,7 @@ class CacheManager(ABC):
         """
         return None
 
-    def observe_prefill_attention(
+    def prepare_prefill_predictor_inputs(
         self,
         layer_idx: int,
         q: torch.Tensor,
@@ -403,12 +403,13 @@ class CacheManager(ABC):
         num_heads: int,
         num_kv_heads: int,
         prefill_is_last_chunk: list[bool] | None = None,
-    ) -> None:
-        """Optional prefill-time attention observer.
+    ) -> torch.Tensor | None:
+        """Optional prefill-time predictor input hook.
 
-        Methods such as AttentionPredictor may need q/k-derived attention rows
-        during prefill to initialize decode-time metadata. The default is a
-        no-op so attention.py can stay method-agnostic.
+        Methods such as AttentionPredictor may need prefill attention rows to
+        initialize decode-time metadata. The default is a no-op so attention.py
+        can stay method-agnostic. An implementation may compute from q/k
+        directly or return an attn_score buffer for the prefill kernel to fill.
         """
         return None
 

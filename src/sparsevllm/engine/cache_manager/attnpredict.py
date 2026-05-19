@@ -74,7 +74,7 @@ class AttnPredictCacheManager(StandardCacheManager):
             self.tsp_mask[layer_idx].pop(int(row_idx), None)
 
     @torch.no_grad()
-    def observe_prefill_attention(
+    def prepare_prefill_predictor_inputs(
         self,
         layer_idx: int,
         q: torch.Tensor,
@@ -88,7 +88,7 @@ class AttnPredictCacheManager(StandardCacheManager):
         num_kv_heads: int,
         prefill_is_last_chunk: list[bool] | None = None,
     ) -> None:
-        """Prefill 阶段：只在最后一个 chunk 用尾部 query 初始化 CNN 历史。预测第一步的掩码
+        """Prefill 阶段：只在最后一个 chunk 用尾部 query 初始化 CNN 历史。
 
         当前假设 最后一个chunk 大小大于 history_step；非最后 chunk 直接跳过，最后
         chunk 取末尾 history_step 个 query 生成首个 decode step 可用的 mask。 TODO： 如果最后一个chunk 小于 history_step,需要利用到上一个chunk的 query 来补齐历史窗口
@@ -98,7 +98,7 @@ class AttnPredictCacheManager(StandardCacheManager):
         if prefill_is_last_chunk is None:
             return
 
-        with profiler.record("attnpredict_observe_prefill_attention"):
+        with profiler.record("attnpredict_prepare_prefill_predictor_inputs"):
             group_size = max(1, num_heads // max(1, num_kv_heads))
             batch_size = int(req_indices.numel())
             for b in range(batch_size):

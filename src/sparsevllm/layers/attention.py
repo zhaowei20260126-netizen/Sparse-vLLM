@@ -206,7 +206,7 @@ class Attention(nn.Module):
                 b_prompt_cache_len = b_seq_len - chunk_lens        # 每个序列的历史 KV 长度
                 max_input_len = b_seq_len.max().item()
 
-                cache_manager.observe_prefill_attention( #TODO:这一步还要重复计算注意力分数，为什么不可以直接利用attn_score?
+                prefill_attn_score = cache_manager.prepare_prefill_predictor_inputs(
                     context.now_layer_idx,
                     q,
                     k_cache,
@@ -218,6 +218,8 @@ class Attention(nn.Module):
                     num_kv_heads=self.num_kv_heads,
                     prefill_is_last_chunk=context.prefill_is_last_chunk,
                 )
+                if prefill_attn_score is not None:
+                    layer_attn_score = prefill_attn_score
 
                 # Triton 路径需要物理槽位 layer_active_slots 用于 Req_to_tokens 寻址
                 # 它内部通过 prompt_cache_len 实现因果掩码，目前不需要显式的 pos_ids

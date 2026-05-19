@@ -118,6 +118,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         self._prefetch_streams = [torch.cuda.Stream() for _ in range(self.num_layers)] # 每层一个 CUDA stream，让后台预取不占用主计算流
         self._prefetch_futures: list[Future | None] = [None for _ in range(self.num_layers)] # 后台任务句柄
         self._prefetch_errors: list[BaseException | None] = [None for _ in range(self.num_layers)] # 后台异常记录，错误发生在后台线程里，不会自动在主线程立刻抛出来
+        self._pending_prefill_views: list[dict[str, object] | None] = [None for _ in range(self.num_layers)]
         self._layer_locks = [threading.RLock() for _ in range(self.num_layers)] #  Python 锁，保护这一层的 GPU active pool 元数据，防止主线程和后台线程同时改
         self._cnn_lock = threading.RLock() # 所有层共享 CNN predictor 的并发保护锁
 
@@ -231,10 +232,6 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         """返回某层 GPU active pool 中的 K/V cache 张量。"""
         return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx]
 
-    def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
-        """offload 版本当前不需要额外的计算张量，直接走 get_layer_kv_cache。"""
-        raise NotImplementedError
-
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
         """返回某层 GPU 侧 row/pos -> active slot 映射表。"""
         return self.buffer_req_to_token_slots[layer_idx]
@@ -249,18 +246,13 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         gpu_free = min(self._num_free_slots) if self._num_free_slots else 0
         return min(int(gpu_free), int(self._num_free_cpu_slots))
 
-    @property
-    def num_free_cpu_slots(self) -> int:
-        """CPU full backing 中剩余的 token slot 数。"""
-        return int(self._num_free_cpu_slots)
-
     def prompt_admission_free_slots(self) -> int:
         """prompt 准入时使用的可用容量。
 
         prefill token 必须同时写入 GPU active pool 和 CPU full backing，
-        所以这里同样用 GPU/CPU 的较小值。
+        num_free_slots 已经取了 GPU/CPU 两侧的较小值。
         """
-        return min(int(self.num_free_slots), int(self.num_free_cpu_slots))
+        return int(self.num_free_slots)
 
     def free_slot_stats(self) -> dict[str, int]:
         """返回调试日志用的 GPU/CPU 剩余 slot 统计。"""
@@ -268,7 +260,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         return {
             "free_slots": int(self.num_free_slots),
             "free_gpu_active_slots": int(gpu_free),
-            "free_cpu_full_slots": int(self.num_free_cpu_slots),
+            "free_cpu_full_slots": int(self._num_free_cpu_slots),
         }
 
     def prefill_batched_tokens_margin(self) -> int:
@@ -552,7 +544,8 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
 
         这是 offload decode 的“按层消费点”：
         - prefill：所有 token 已经在 _prepare_prefill 中分配好 GPU slots，直接返回。
-        - decode：到达某一层时，才等待该层上一轮 prefetch；然后同步补齐仍缺的历史 active set；最后给当前新 token 分配本层 GPU slot。
+        - decode：到达某一层时，才等待该层上一轮 prefetch；如果没有成功预取，
+          再同步补齐历史 active set；最后给当前新 token 分配本层 GPU slot。
 
         这样不会在 decode step 一开始就等待所有层的预取，而是让前面层的计算
         和后面层的后台预取自然 overlap。
@@ -561,20 +554,23 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         if not ctx.is_prefill:
             # 等待attention 结束后提交的 predictor + CPU->GPU prefetch。如果失败，下面的
             # _ensure_positions_resident 会同步从 CPU backing 再补一遍。
-            self._wait_prefetch(layer_idx)
+            had_prefetch = self._prefetch_futures[layer_idx] is not None
+            prefetch_ok = self._wait_prefetch(layer_idx)
 
-            # 根据上一轮 predictor mask，准备本层当前 step 需要的历史 token。 TODO：这个在上一步_wait_prefetch里等预取的时候就准备好，为什么还要等到这里还要重复准备一次？感觉有点重复了
+            # 根据上一轮 predictor mask，准备本层当前 step 需要的历史 token。
+            # 如果上面的异步预取已成功，这里只构造 view，不再重复搬运 KV。
             base_positions = self._decode_base_positions(layer_idx)
-            if base_positions:
+            if base_positions and (not had_prefetch or not prefetch_ok):
                 self._ensure_positions_resident(layer_idx, base_positions, stream=None)
 
             state = self.layer_batch_states[layer_idx]
-            assert state.req_indices is not None
-            assert state.context_lens is not None
+            if self._decode_rows is None or self._decode_current_positions is None:
+                raise RuntimeError("AttnPredict offload decode metadata is not initialized.")
 
-            # 当前 decode token 的逻辑位置是 context_len - 1。它刚在 _prepare_decode()中分配了 CPU slot，但还没有本层 GPU slot；这里逐层分配。
-            rows = state.req_indices.to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=False)
-            current_positions = state.context_lens.to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=False) - 1 # TODO:这里直接用self._decode_current_positions不就行了，为什么还要从state里拿context_lens来算一次？感觉有点重复了
+            # 当前 decode token 刚在 _prepare_decode() 中分配了 CPU slot，
+            # 但还没有本层 GPU slot；这里逐层分配。
+            rows = self._decode_rows
+            current_positions = self._decode_current_positions
             current_slots = self._ensure_current_decode_slots(layer_idx, rows, current_positions)
             state.slot_mapping = torch.tensor(current_slots, dtype=torch.int32, device="cuda")
 
@@ -591,7 +587,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
 
     def _ensure_current_decode_slots(
         self,
-        layer_idx: intw,
+        layer_idx: int,
         rows: np.ndarray,
         positions: np.ndarray,
     ) -> list[int]:
@@ -644,6 +640,119 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
             self.cpu_kv_cache[0, layer_idx].index_copy_(0, cpu_slots, host_k) # 沿着第0维（slot维度），将host_k的内容根据slot位置cpu_slots复制到cpu_kv_cache的对应位置
             self.cpu_kv_cache[1, layer_idx].index_copy_(0, cpu_slots, host_v)
 
+    @torch.no_grad()
+    def prepare_prefill_predictor_inputs(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+        prefill_is_last_chunk: list[bool] | None = None,
+    ) -> torch.Tensor | None:
+        """Prefill 最后一块chunk 的 predictor 初始化。
+
+        返回一个 4D tail-score buffer 给 prefill kernel 填写：
+            [batch, num_heads, history_step, max_context_len]
+
+        on_prefill_layer_end() 会在 attention kernel 完成后消费这个 buffer，
+        同步或异步初始化首个 decode 所需的 predictor mask。
+        """
+        view = self._make_prefill_tail_score_view(
+            q=q,
+            req_indices=req_indices,
+            context_lens=context_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            num_heads=num_heads,
+            prefill_is_last_chunk=prefill_is_last_chunk,
+        )
+        if view is None:
+            self._pending_prefill_views[layer_idx] = None
+            return None
+
+        self._pending_prefill_views[layer_idx] = view
+        tail_score = view["tail_score"]
+        assert isinstance(tail_score, torch.Tensor)
+        return tail_score
+
+    def _make_prefill_tail_score_view(
+        self,
+        *,
+        q: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None,
+        num_heads: int,
+        prefill_is_last_chunk: list[bool] | None,
+    ) -> dict[str, object] | None:
+        if cu_seqlens_q is None or cu_seqlens_q.numel() <= 1:
+            return None
+        if prefill_is_last_chunk is None:
+            return None
+        last_flags = [bool(x) for x in prefill_is_last_chunk]
+        if not any(last_flags):
+            return None
+
+        batch_size = int(req_indices.numel())
+        history = int(self.history_step)
+        max_len = int(context_lens.max().item())
+        tail_score = torch.full(
+            (batch_size, int(num_heads), history, max_len),
+            -float("inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        return {
+            "tail_score": tail_score,
+            "req_indices": req_indices.detach().to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=True),
+            "context_lens": context_lens.detach().to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=True),
+            "cu_seqlens_q": cu_seqlens_q.detach().to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=True),
+            "prefill_is_last_chunk": last_flags,
+            "num_heads": int(num_heads),
+        }
+
+    def _predict_prefill_positions_sync(
+        self,
+        layer_idx: int,
+        view: dict[str, object],
+    ) -> dict[int, np.ndarray]:
+        tail_score = view["tail_score"]
+        req_indices = view["req_indices"]
+        context_lens = view["context_lens"]
+        cu_seqlens_q = view["cu_seqlens_q"]
+        prefill_is_last_chunk = view["prefill_is_last_chunk"]
+        assert isinstance(tail_score, torch.Tensor)
+        assert isinstance(req_indices, np.ndarray)
+        assert isinstance(context_lens, np.ndarray)
+        assert isinstance(cu_seqlens_q, np.ndarray)
+        assert isinstance(prefill_is_last_chunk, list)
+
+        row_positions: dict[int, np.ndarray] = {}
+        for b, row_idx in enumerate(req_indices.tolist()):
+            if not prefill_is_last_chunk[b]:
+                continue
+
+            q_end = int(cu_seqlens_q[b + 1])
+            q_start = int(cu_seqlens_q[b])
+            q_len = q_end - q_start
+            full_len = int(context_lens[b])
+            if q_len <= 0 or full_len <= 0:
+                continue
+
+            take = min(self.history_step, q_len)
+            logits = tail_score[b, :, :take, :full_len].to(torch.float32)
+            logits = logits * self.attn_scale
+            attn = torch.softmax(logits, dim=-1).to(self.hf_config.torch_dtype)
+
+            self._update_row_prediction(layer_idx, int(row_idx), attn)
+            row_positions[int(row_idx)] = self._positions_from_mask(layer_idx, int(row_idx), full_len)
+        return row_positions
+
     def build_decode_view(
         self,
         layer_idx: int,
@@ -679,7 +788,9 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
 
         packed_slots = torch.full((batch_size, max_keep), -1, dtype=torch.int32, device=q.device)
         packed_positions = torch.full((batch_size, max_keep), -1, dtype=torch.int32, device=q.device)
-        rows = req_indices.to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=False)
+        rows = self._decode_rows
+        if rows is None:
+            rows = req_indices.to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=False)
         mirror = self.gpu_req_to_token_slots_cpu[layer_idx]
         for b, (row_idx, positions) in enumerate(zip(rows.tolist(), view_positions)):
             # positions 在 get_layer_store_view() 中已经确保 resident，这里只做查表和打包。
@@ -742,42 +853,34 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         """最后一个 prefill chunk 的 attention 完成后，准备首个 decode 的 active set。
 
         prefill 本身保持 full attention，不做稀疏。只有最后一个 prefill chunk
-        已经通过 observe_prefill_attention() 初始化了 tsp_mask 后，才在这里根据
-        mask 释放非 active GPU slots，并保留/预取首个 decode 需要的 token。
+        才会在这里根据首个 decode mask 释放非 active GPU slots，并保留/预取
+        首个 decode 需要的 token。prefetch=true 时，mask 初始化和 residency
+        更新都在后台 worker 里完成。
         """
         ctx = get_context()
         if not ctx.is_prefill or not ctx.prefill_is_last_chunk: 
             return
-        state = self.layer_batch_states[layer_idx]
-        if state.req_indices is None:
+
+        pending_view = self._pending_prefill_views[layer_idx]
+        if pending_view is None:
             return
-        rows = state.req_indices.to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=False)
-        row_positions = {}
-        for b, row_idx in enumerate(rows.tolist()):
-            if not ctx.prefill_is_last_chunk[b]:
-                continue
-            # prefill 后 CPU full backing 已有完整 prompt，mask 也已经初始化；
-            # 根据 mask 得到首个 decode step 本层应该保留在 GPU 的 positions。
-            full_len = int(self.row_seq_lens[int(row_idx)])
-            row_positions[int(row_idx)] = self._positions_from_mask(layer_idx, int(row_idx), full_len) #根据掩码得出来的topk个保留的位置
-        if not row_positions:
+        self._pending_prefill_views[layer_idx] = None
+
+        if self._prefetch_enabled:
+            self._wait_prefetch(layer_idx)
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            self._prefetch_futures[layer_idx] = self._prefetch_executor.submit(
+                self._prefill_predict_and_prefetch_worker, # 包含predict_prefill_positions_sync和_ensure_positions_resident
+                layer_idx,
+                pending_view,
+                event,
+            )
             return
 
-        if not self._prefetch_enabled:
-            self._ensure_positions_resident(layer_idx, row_positions, stream=None)
-            return
-
-        # 和 decode 一样，prefill 后的裁剪/预取也放到后台 stream 中执行，
-        # 主线程可以继续后续层或结束本轮 forward。
-        self._wait_prefetch(layer_idx)
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream())
-        self._prefetch_futures[layer_idx] = self._prefetch_executor.submit(
-            self._positions_prefetch_worker,
-            layer_idx,
-            row_positions,
-            event,
-        )
+        with torch.inference_mode(), profiler.record("attnpredict_prepare_prefill_predictor_inputs"):
+            row_positions = self._predict_prefill_positions_sync(layer_idx, pending_view)
+        self._ensure_positions_resident(layer_idx, row_positions, stream=None)
 
     def _predict_and_prefetch_worker(
         self,
@@ -806,20 +909,22 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
             done.record(stream)
         return done
 
-    def _positions_prefetch_worker(
+    def _prefill_predict_and_prefetch_worker(
         self,
         layer_idx: int,
-        row_positions: dict[int, np.ndarray],
+        view: dict[str, object],
         attention_done_event: torch.cuda.Event,
     ) -> torch.cuda.Event:
-        """后台任务：不运行 CNN，只按已知 positions 更新 GPU active pool。
-
-        用于 prefill 最后一块之后的首次 active set 准备。
-        """
-        torch.cuda.set_device(self.kv_cache.device)
+        """后台任务：prefill 最后一块结束后初始化 predictor，并准备首个 decode active set。"""
+        tail_score = view["tail_score"]
+        assert isinstance(tail_score, torch.Tensor)
+        torch.cuda.set_device(tail_score.device)
         stream = self._prefetch_streams[layer_idx]
-        with torch.cuda.stream(stream):
+        with torch.inference_mode(), torch.cuda.stream(stream):
             stream.wait_event(attention_done_event)
+            with profiler.record("attnpredict_offload_prefill_predict_stream"):
+                row_positions = self._predict_prefill_positions_sync(layer_idx, view)
+
         self._ensure_positions_resident(layer_idx, row_positions, stream=stream)
         with torch.cuda.stream(stream):
             done = torch.cuda.Event()
@@ -888,6 +993,11 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
 
     def _time_sequence_predict(self, attn_history: torch.Tensor) -> tuple[torch.Tensor, int]:
         """串行化 CNN predictor forward。
+
+        这个方法不是直接在 offload 文件里显式调用，而是通过父类
+        _update_row_prediction() 多态调用。当前调用链包括：
+        prepare_prefill_predictor_inputs/_predict_prefill_positions_sync/_predict_next_positions_sync ->
+        _update_row_prediction() -> self._time_sequence_predict()。
 
         多个层的后台线程可能同时调用同一个 self.cnn。为避免共享模块并发 forward
         带来的状态/stream 风险，这里用一个轻量锁把 CNN 调用串行化；具体计算仍然
@@ -1063,11 +1173,3 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         self.cpu_req_to_token_slots[row_idx, :] = -1
         self.row_seq_lens[row_idx] = 0
         self.free_rows.append(row_idx)
-
-    def free_part_slots(self, layer_idx: int, seq: Sequence, keep_indices: torch.Tensor):
-        """禁止外部按 keep_indices 释放 slots。
-
-        attnpredict-offload 的 GPU active slot 生命周期由 predictor prefetch 统一管理；
-        如果外部再调用 SnapKV 式 partial free，会破坏 CPU/GPU residency 映射。
-        """
-        raise ValueError("attnpredict-offload manages active GPU slots through predictor prefetch.")
