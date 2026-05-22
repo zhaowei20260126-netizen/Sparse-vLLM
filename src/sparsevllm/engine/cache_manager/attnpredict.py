@@ -437,7 +437,7 @@ class AttnPredictCacheManager(StandardCacheManager):
             return keep_mask
 
         # per-head 得分 → head 维 max → shared block 得分
-        block_scores = tsp_attn.max(dim=0).values if tsp_attn.dim() == 2 else tsp_attn
+        block_scores = tsp_attn.max(dim=0).values if tsp_attn.dim() == 2 else tsp_attn #TODO 目前版本是取头维 max-pooling, 后续可以考虑其他聚合方式或保留 per-head 预测结果
         _, topk_indices = torch.topk(block_scores, block_budget, dim=-1)
 
         # block 索引展开为 token 索引

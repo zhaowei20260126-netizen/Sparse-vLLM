@@ -439,7 +439,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         load_cpu_slots: list[int] = []  # 待加载 token 在 CPU full backing 中的 slot。
         load_gpu_slots: list[int] = []  # 为待加载 token 新分配的 GPU active slot。
 
-        with self._layer_locks[layer_idx]:
+        with self._layer_locks[layer_idx]: #TODO 这是有cpu端做的，会不会拉满速度
             for row_idx, positions in row_positions.items():
                 full_len = int(self.row_seq_lens[row_idx])
 
@@ -641,7 +641,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         self._pending_prefill_views[layer_idx] = view
         return view["tail_score"]
 
-    def _make_prefill_tail_score_view(
+    def _make_prefill_tail_score_view( #
         self,
         *,
         q: torch.Tensor,
@@ -703,7 +703,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
             logits = logits * self.attn_scale
             attn = torch.softmax(logits, dim=-1).to(self.hf_config.torch_dtype)
 
-            self._update_row_prediction(layer_idx, int(row_idx), attn)
+            self._update_row_prediction(layer_idx, int(row_idx), attn) # 更新该层该seq的 predictor 的 mask
             row_positions[int(row_idx)] = self._positions_from_mask(layer_idx, int(row_idx), full_len)
         self._next_base_positions[layer_idx] = row_positions
         return row_positions
