@@ -52,8 +52,10 @@ class Config:
     attnpredict_offload_cpu_slots: int = -1
     attnpredict_offload_cpu_memory_utilization: float = 0.70
     attnpredict_offload_pin_staging: bool = True
-    attnpredict_reuse_steps: int = 4
-    attnpredict_max_stale_steps: int = 8
+    # Offload 默认把 predictor refresh 摊薄，避免 128K decode 被 CNN refresh 主导；
+    # 需要研究 refresh 行为时可显式调小这两个值（例如 4/8）。
+    attnpredict_reuse_steps: int = 100000
+    attnpredict_max_stale_steps: int = 100000
 
     # SnapKV Config
     snapkv_window_size: int = 32

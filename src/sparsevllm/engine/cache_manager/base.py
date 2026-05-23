@@ -428,6 +428,16 @@ class CacheManager(ABC):
         """
         return True
 
+    def decode_attn_score_max_len(self, layer_idx: int, context_lens: torch.Tensor) -> int:
+        """Return the decode attn_score width needed by the current method.
+
+        Most methods collect scores over the full logical context. Methods that
+        build a packed decode view can override this to avoid allocating a
+        full-context score buffer before ``build_decode_view`` shrinks the read
+        view.
+        """
+        return int(context_lens.max().item())
+
     def build_decode_view(
         self,
         layer_idx: int,
