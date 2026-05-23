@@ -413,6 +413,21 @@ class CacheManager(ABC):
         """
         return None
 
+    def prefill_attn_score_block_size(self, layer_idx: int) -> int | None:
+        """让 attention.py 不需要判断是不是 attnpredict-offload。默认返回 None，
+        普通方法不受影响；offload 方法覆写它，
+        告诉 prefill kernel：4D attn_score 是 block 级 buffer。
+        """
+        return None
+
+    def should_collect_decode_attn_score(self, layer_idx: int) -> bool:
+        """Return whether this decode step should collect attention logits.
+
+        Sparse methods that reuse predictor state can skip score collection on
+        non-refresh decode steps. The default keeps legacy per-step behavior.
+        """
+        return True
+
     def build_decode_view(
         self,
         layer_idx: int,

@@ -52,6 +52,8 @@ class Config:
     attnpredict_offload_cpu_slots: int = -1
     attnpredict_offload_cpu_memory_utilization: float = 0.70
     attnpredict_offload_pin_staging: bool = True
+    attnpredict_reuse_steps: int = 4
+    attnpredict_max_stale_steps: int = 8
 
     # SnapKV Config
     snapkv_window_size: int = 32
@@ -198,6 +200,10 @@ class Config:
                     raise ValueError("attnpredict_offload_cpu_threads 必须 >= 1")
                 if self.attnpredict_offload_cpu_slots == 0 or self.attnpredict_offload_cpu_slots < -1:
                     raise ValueError("attnpredict_offload_cpu_slots 必须为 -1 或正整数")
+                if int(self.attnpredict_reuse_steps) < 1:
+                    raise ValueError("attnpredict_reuse_steps 必须 >= 1")
+                if int(self.attnpredict_max_stale_steps) < int(self.attnpredict_reuse_steps):
+                    raise ValueError("attnpredict_max_stale_steps 必须 >= attnpredict_reuse_steps")
                 try:
                     cpu_mem_util = float(self.attnpredict_offload_cpu_memory_utilization)
                 except (TypeError, ValueError) as e:

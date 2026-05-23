@@ -308,7 +308,7 @@ def _fwd_kernel_with_tail_score(
     stride_req_to_tokens_b, stride_req_to_tokens_s,
     stride_asb, stride_ash, stride_ast, stride_asl,
     kv_group_num, b_prompt_cache_len,
-    HISTORY_STEP: tl.constexpr,
+    HISTORY_STEP: tl.constexpr, TAIL_BLOCK_SIZE: tl.constexpr, TAIL_BLOCKS_PER_N: tl.constexpr,
     H: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     start_m = tl.program_id(0)
@@ -355,20 +355,6 @@ def _fwd_kernel_with_tail_score(
 
         mask = (offs_m[:, None] + prompt_cache_len) >= kv_pos[None, :]
 
-        # AttentionPredictor 需要最后 HISTORY_STEP 个 query 各自对 full KV 的 raw QK。
-        # 这里保留 query 维度，不做 sum/mean/max 聚合；不可见位置保持调用方预填的 -inf。
-        score_offsets = (
-            cur_batch * stride_asb
-            + cur_head * stride_ash
-            + tail_idx[:, None] * stride_ast
-            + kv_pos[None, :] * stride_asl
-        )
-        tl.store(
-            Attn_Score + score_offsets,
-            qk,
-            mask=tail_q_mask[:, None] & mask & (kv_pos[None, :] < block_end_loc),
-        )
-
         qk = tl.where(mask, qk * sm_scale, -1.0e8)
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -382,6 +368,44 @@ def _fwd_kernel_with_tail_score(
         v = tl.load(V + off_v, mask=kv_pos[:, None] < block_end_loc, other=0.0)
         acc = tl.dot(p.to(v.dtype), v, acc)
         m_i = m_ij
+
+    # AttentionPredictor 只需要 block 级历史。这里第二遍扫描 K，
+    # 用第一遍得到的全局 softmax 归一化量，把每个 KV block 内的
+    # token probability 做 max 聚合，等价于 Python 端
+    # softmax(token logits) -> max_pooling(block)。
+    for start_n in range(0, block_mask * block_end_loc, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        kv_pos = start_n + offs_n
+        kv_loc = tl.load(
+            Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * kv_pos,
+            mask=kv_pos < block_end_loc, other=0,
+        )
+        off_k = kv_loc[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
+        k = tl.load(K + off_k, mask=kv_pos[None, :] < block_end_loc, other=0.0)
+        qk = tl.dot(q, k)
+
+        mask = (offs_m[:, None] + prompt_cache_len) >= kv_pos[None, :]
+        valid = mask & (kv_pos[None, :] < block_end_loc)
+        qk = tl.where(valid, qk * sm_scale, -1.0e20)
+        prob = tl.math.exp2(qk - m_i[:, None]) / l_i[:, None]
+        prob = tl.where(valid, prob, 0.0)
+
+        for block_group in tl.static_range(0, TAIL_BLOCKS_PER_N):
+            block_start = start_n + block_group * TAIL_BLOCK_SIZE
+            block_idx = block_start // TAIL_BLOCK_SIZE
+            in_block = (kv_pos >= block_start) & (kv_pos < block_start + TAIL_BLOCK_SIZE)
+            block_score = tl.max(tl.where(in_block[None, :], prob, 0.0), 1)
+            score_offsets = (
+                cur_batch * stride_asb
+                + cur_head * stride_ash
+                + tail_idx * stride_ast
+                + block_idx * stride_asl
+            )
+            tl.store(
+                Attn_Score + score_offsets,
+                block_score,
+                mask=tail_q_mask & (block_start < block_end_loc),
+            )
 
     acc = acc / l_i[:, None]
     off_o = (
@@ -499,7 +523,8 @@ def _fwd_kernel_with_score_2d(
 @torch.no_grad()
 def context_attention_fwd(
     q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, req_to_token_indexs,
-    attn_score=None
+    attn_score=None,
+    attn_score_block_size=None,
 ):
     # --- 第1步: 确定分块大小 ---
     # Tesla 老卡 (T4/V100) SRAM 较小，用更小的 BLOCK_M 避免溢出
@@ -573,11 +598,20 @@ def context_attention_fwd(
         )
     elif attn_score.dim() == 4:
         # =================================================================
-        # 分支 B0: 收集 AttentionPredictor tail 分数
+        # 分支 B0: 收集 AttentionPredictor block-level tail 分数
         # =================================================================
-        # 形状: (B, num_heads, history_step, kv_len)
-        # 行为: 只保存每个序列最后 history_step 个 query 对完整 KV 的 raw QK，
-        #       保留 query 时间维度，供 AttentionPredictor 初始化历史。
+        # 形状: (B, num_heads, history_step, ceil(kv_len / block_size))
+        # 行为: 模型 attention 仍完整看 KV；旁路分数只保存每个 block 内
+        #       max softmax probability，供 AttentionPredictor 初始化历史。
+        if attn_score_block_size is None:
+            raise ValueError("4D prefill attn_score requires attn_score_block_size")
+        attn_score_block_size = int(attn_score_block_size)
+        if attn_score_block_size <= 0:
+            raise ValueError("attn_score_block_size must be > 0")
+        if BLOCK_N % attn_score_block_size != 0:
+            raise ValueError(
+                f"attn_score_block_size={attn_score_block_size} must divide BLOCK_N={BLOCK_N}"
+            )
         _fwd_kernel_with_tail_score[grid](
             q, k, v, sm_scale, o, b_start_loc, b_seq_len, req_to_token_indexs, b_req_idx,
             attn_score,
@@ -589,6 +623,8 @@ def context_attention_fwd(
             attn_score.stride(0), attn_score.stride(1), attn_score.stride(2), attn_score.stride(3),
             kv_group_num=kv_group_num, b_prompt_cache_len=b_prompt_cache_len,
             HISTORY_STEP=attn_score.shape[2],
+            TAIL_BLOCK_SIZE=attn_score_block_size,
+            TAIL_BLOCKS_PER_N=BLOCK_N // attn_score_block_size,
             H=head, BLOCK_DMODEL=Lk, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
             num_warps=num_warps, num_stages=num_stages,
         )

@@ -627,8 +627,10 @@ class SparseController:
         # =====================================================================
         # decode 时每层都收集 attention logits，cache manager 会按原始实现转成 softmax 权重。
         # prefill 不需要（不做预测，全量 attention）。
-        if self.sparse_method in ('attnpredict', 'attnpredict-offload'):
+        if self.sparse_method == 'attnpredict':
             return not is_prefill
+        if self.sparse_method == 'attnpredict-offload':
+            return (not is_prefill) and self.cache_manager.should_collect_decode_attn_score(layer_idx)
 
         if self.sparse_method == 'deltakv-snapkv':
             if not is_prefill or get_context().is_long_text is False:

@@ -323,6 +323,35 @@ class AttnPredictCacheManager(StandardCacheManager):
             device=attn_weights_full.device,
         )
 
+    def _update_row_prediction_from_pooled(
+        self,
+        layer_idx: int,
+        row_idx: int,
+        attn_pooling: torch.Tensor,
+        *,
+        seq_len: int,
+    ) -> None:
+        """更新指定 cache row 的 block 级 attention 历史，并预测新的 keep mask。
+
+        attn_pooling 已经是 `_max_pooling()` 后的形状：
+            (num_heads, history_rows, pooled_len)
+        该 helper 给 block 级 prefill tail-score 使用，避免先构造 token 级
+        attention 再重复 pooling。
+        """
+        hist = self._update_pooled_attn_history(
+            self.attn_history[layer_idx].get(row_idx),
+            attn_pooling,
+        )
+        self.attn_history[layer_idx][row_idx] = hist
+
+        tsp_attn, start_block = self._time_sequence_predict(hist)
+        self.tsp_mask[layer_idx][row_idx] = self._create_tsp_mask(
+            tsp_attn,
+            seq_len=int(seq_len),
+            start_block=start_block,
+            device=attn_pooling.device,
+        )
+
     def _max_pooling(self, tensor: torch.Tensor) -> torch.Tensor:
         """对序列维度按 block_size 做 max-pooling，与原始 AttentionPredictor 代码一致。
 
@@ -346,6 +375,14 @@ class AttnPredictCacheManager(StandardCacheManager):
         """
         # 先做 block 级 max-pooling，再截取尾部
         attn_pooling = self._max_pooling(attn_weights_full)
+        return self._update_pooled_attn_history(attn_history, attn_pooling)
+
+    def _update_pooled_attn_history(
+        self,
+        attn_history: torch.Tensor | None,
+        attn_pooling: torch.Tensor,
+    ) -> torch.Tensor:
+        """滚动更新已经池化到 block 级的 attention 历史窗口。"""
         if attn_pooling.shape[-2] > self.history_step:
             attn_pooling = attn_pooling[:, -self.history_step:, :]
 
