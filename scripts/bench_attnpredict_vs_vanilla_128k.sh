@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Benchmark vanilla full attention vs AttentionPredictor on one long context.
+# Benchmark vanilla full attention vs AttentionPredictor offload on one long context.
 #
 # Required:
 #   MODEL_PATH=/path/to/base/model
@@ -19,6 +19,11 @@ set -euo pipefail
 #   NUM_RECENT_TOKENS=512
 #   ATTNPREDICT_HISTORY_STEPS=64
 #   ATTNPREDICT_POOLING_BLOCK_SIZE=16
+#   ATTNPREDICT_OFFLOAD_PREFETCH=true
+#   ATTNPREDICT_OFFLOAD_CPU_THREADS=8
+#   ATTNPREDICT_OFFLOAD_CPU_SLOTS=-1
+#   ATTNPREDICT_OFFLOAD_CPU_MEMORY_UTILIZATION=0.70
+#   ATTNPREDICT_OFFLOAD_PIN_STAGING=true
 #   SPARSEVLLM_MASTER_PORT=2345
 #   EXTRA_HYPER_PARAMS_JSON='{"max_num_batched_tokens":8192}'
 
@@ -51,6 +56,11 @@ NUM_SINK_TOKENS="${NUM_SINK_TOKENS:-64}"
 NUM_RECENT_TOKENS="${NUM_RECENT_TOKENS:-512}"
 ATTNPREDICT_HISTORY_STEPS="${ATTNPREDICT_HISTORY_STEPS:-64}"
 ATTNPREDICT_POOLING_BLOCK_SIZE="${ATTNPREDICT_POOLING_BLOCK_SIZE:-16}"
+ATTNPREDICT_OFFLOAD_PREFETCH="${ATTNPREDICT_OFFLOAD_PREFETCH:-true}"
+ATTNPREDICT_OFFLOAD_CPU_THREADS="${ATTNPREDICT_OFFLOAD_CPU_THREADS:-8}"
+ATTNPREDICT_OFFLOAD_CPU_SLOTS="${ATTNPREDICT_OFFLOAD_CPU_SLOTS:--1}"
+ATTNPREDICT_OFFLOAD_CPU_MEMORY_UTILIZATION="${ATTNPREDICT_OFFLOAD_CPU_MEMORY_UTILIZATION:-0.70}"
+ATTNPREDICT_OFFLOAD_PIN_STAGING="${ATTNPREDICT_OFFLOAD_PIN_STAGING:-true}"
 EXTRA_HYPER_PARAMS_JSON="${EXTRA_HYPER_PARAMS_JSON:-{}}"
 export ATTNPREDICT_MODEL_PATH
 export GPU_MEMORY_UTILIZATION
@@ -61,12 +71,27 @@ export NUM_SINK_TOKENS
 export NUM_RECENT_TOKENS
 export ATTNPREDICT_HISTORY_STEPS
 export ATTNPREDICT_POOLING_BLOCK_SIZE
+export ATTNPREDICT_OFFLOAD_PREFETCH
+export ATTNPREDICT_OFFLOAD_CPU_THREADS
+export ATTNPREDICT_OFFLOAD_CPU_SLOTS
+export ATTNPREDICT_OFFLOAD_CPU_MEMORY_UTILIZATION
+export ATTNPREDICT_OFFLOAD_PIN_STAGING
 export EXTRA_HYPER_PARAMS_JSON
 
 HYPER_PARAMS="$(
   python - <<'PY'
 import json
 import os
+
+
+def env_bool(name):
+    value = os.environ[name].strip().lower()
+    if value in ("1", "true", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "no", "n", "off"):
+        return False
+    raise SystemExit(f"{name} must be a boolean")
+
 
 params = {
     "gpu_memory_utilization": float(os.environ["GPU_MEMORY_UTILIZATION"]),
@@ -75,6 +100,11 @@ params = {
     "attnpredict_model_path": os.environ["ATTNPREDICT_MODEL_PATH"],
     "attnpredict_history_steps": int(os.environ["ATTNPREDICT_HISTORY_STEPS"]),
     "attnpredict_pooling_block_size": int(os.environ["ATTNPREDICT_POOLING_BLOCK_SIZE"]),
+    "attnpredict_offload_prefetch": env_bool("ATTNPREDICT_OFFLOAD_PREFETCH"),
+    "attnpredict_offload_cpu_threads": int(os.environ["ATTNPREDICT_OFFLOAD_CPU_THREADS"]),
+    "attnpredict_offload_cpu_slots": int(os.environ["ATTNPREDICT_OFFLOAD_CPU_SLOTS"]),
+    "attnpredict_offload_cpu_memory_utilization": float(os.environ["ATTNPREDICT_OFFLOAD_CPU_MEMORY_UTILIZATION"]),
+    "attnpredict_offload_pin_staging": env_bool("ATTNPREDICT_OFFLOAD_PIN_STAGING"),
     "num_top_tokens": int(os.environ["NUM_TOP_TOKENS"]),
     "num_sink_tokens": int(os.environ["NUM_SINK_TOKENS"]),
     "num_recent_tokens": int(os.environ["NUM_RECENT_TOKENS"]),
@@ -87,7 +117,7 @@ print(json.dumps(params, separators=(",", ":")))
 PY
 )"
 
-echo "Benchmarking vanilla vs attnpredict"
+echo "Benchmarking vanilla vs attnpredict-offload"
 echo "  MODEL_PATH=${MODEL_PATH}"
 echo "  ATTNPREDICT_MODEL_PATH=${ATTNPREDICT_MODEL_PATH}"
 echo "  LENGTHS=${LENGTHS}"
@@ -98,7 +128,7 @@ echo "  HYPER_PARAMS=${HYPER_PARAMS}"
 
 python scripts/bench_sparse_vllm.py \
   --model_path "${MODEL_PATH}" \
-  --methods vanilla,attnpredict \
+  --methods vanilla,attnpredict-offload \
   --lengths "${LENGTHS}" \
   --batch_sizes "${BATCH_SIZES}" \
   --output_len "${OUTPUT_LEN}" \
