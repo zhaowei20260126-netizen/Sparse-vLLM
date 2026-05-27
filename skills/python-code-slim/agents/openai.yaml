@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python Code Slim"
+  short_description: "Keep Python inference code small and correct"
+  default_prompt: "Use $python-code-slim to implement or refactor Python inference code with minimal correct changes."
