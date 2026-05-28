@@ -414,29 +414,12 @@ class CacheManager(ABC):
         return None
 
     def prefill_attn_score_block_size(self, layer_idx: int) -> int | None:
-        """让 attention.py 不需要判断是不是 attnpredict-offload。默认返回 None，
-        普通方法不受影响；offload 方法覆写它，
-        告诉 prefill kernel：4D attn_score 是 block 级 buffer。
-        """
+        """返回 prefill 4D attn_score 的 block 粒度；默认 token 级或不使用。"""
         return None
 
     def should_collect_decode_attn_score(self, layer_idx: int) -> bool:
-        """Return whether this decode step should collect attention logits.
-
-        Sparse methods that reuse predictor state can skip score collection on
-        non-refresh decode steps. The default keeps legacy per-step behavior.
-        """
+        """decode 是否需要收集 attention score；默认保持每步收集。"""
         return True
-
-    def decode_attn_score_max_len(self, layer_idx: int, context_lens: torch.Tensor) -> int:
-        """Return the decode attn_score width needed by the current method.
-
-        Most methods collect scores over the full logical context. Methods that
-        build a packed decode view can override this to avoid allocating a
-        full-context score buffer before ``build_decode_view`` shrinks the read
-        view.
-        """
-        return int(context_lens.max().item())
 
     def build_decode_view(
         self,

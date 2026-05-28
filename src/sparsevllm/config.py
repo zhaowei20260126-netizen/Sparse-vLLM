@@ -47,15 +47,13 @@ class Config:
     attnpredict_history_steps: int = 64
     attnpredict_pooling_block_size: int = 16
     attnpredict_model_path: str = ""
+    attnpredict_reuse_steps: int = 4
+    attnpredict_max_stale_steps: int = 6
     attnpredict_offload_prefetch: bool = True
     attnpredict_offload_cpu_threads: int = 8
     attnpredict_offload_cpu_slots: int = -1
     attnpredict_offload_cpu_memory_utilization: float = 0.70
     attnpredict_offload_pin_staging: bool = True
-    # Offload 默认把 predictor refresh 摊薄，避免 128K decode 被 CNN refresh 主导；
-    # 需要研究 refresh 行为时可显式调小这两个值（例如 4/8）。
-    attnpredict_reuse_steps: int = 100000
-    attnpredict_max_stale_steps: int = 100000
 
     # SnapKV Config
     snapkv_window_size: int = 32
@@ -197,15 +195,15 @@ class Config:
                 raise ValueError("attnpredict_history_steps 必须 > 0")
             if self.attnpredict_pooling_block_size <= 0:
                 raise ValueError("attnpredict_pooling_block_size 必须 > 0")
+            if self.attnpredict_reuse_steps <= 0:
+                raise ValueError("attnpredict_reuse_steps 必须 > 0")
+            if self.attnpredict_max_stale_steps < self.attnpredict_reuse_steps:
+                raise ValueError("attnpredict_max_stale_steps 必须 >= attnpredict_reuse_steps")
             if self.vllm_sparse_method == "attnpredict-offload":
                 if self.attnpredict_offload_cpu_threads < 1:
                     raise ValueError("attnpredict_offload_cpu_threads 必须 >= 1")
                 if self.attnpredict_offload_cpu_slots == 0 or self.attnpredict_offload_cpu_slots < -1:
                     raise ValueError("attnpredict_offload_cpu_slots 必须为 -1 或正整数")
-                if int(self.attnpredict_reuse_steps) < 1:
-                    raise ValueError("attnpredict_reuse_steps 必须 >= 1")
-                if int(self.attnpredict_max_stale_steps) < int(self.attnpredict_reuse_steps):
-                    raise ValueError("attnpredict_max_stale_steps 必须 >= attnpredict_reuse_steps")
                 try:
                     cpu_mem_util = float(self.attnpredict_offload_cpu_memory_utilization)
                 except (TypeError, ValueError) as e:

@@ -369,10 +369,7 @@ def _fwd_kernel_with_tail_score(
         acc = tl.dot(p.to(v.dtype), v, acc)
         m_i = m_ij
 
-    # AttentionPredictor 只需要 block 级历史。这里第二遍扫描 K，
-    # 用第一遍得到的全局 softmax 归一化量，把每个 KV block 内的
-    # token probability 做 max 聚合，等价于 Python 端
-    # softmax(token logits) -> max_pooling(block)。
+    # 只写 block 级 tail-score：等价于 softmax(token logits) 后按 pooling block 做 max。
     for start_n in range(0, block_mask * block_end_loc, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         kv_pos = start_n + offs_n
@@ -598,11 +595,10 @@ def context_attention_fwd(
         )
     elif attn_score.dim() == 4:
         # =================================================================
-        # 分支 B0: 收集 AttentionPredictor block-level tail 分数
+        # 分支 B0: 收集 AttentionPredictor tail 分数
         # =================================================================
         # 形状: (B, num_heads, history_step, ceil(kv_len / block_size))
-        # 行为: 模型 attention 仍完整看 KV；旁路分数只保存每个 block 内
-        #       max softmax probability，供 AttentionPredictor 初始化历史。
+        # 行为: 模型仍完整看 KV；旁路分数只保存每个 block 内 max probability。
         if attn_score_block_size is None:
             raise ValueError("4D prefill attn_score requires attn_score_block_size")
         attn_score_block_size = int(attn_score_block_size)

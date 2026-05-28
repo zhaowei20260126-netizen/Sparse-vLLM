@@ -135,10 +135,7 @@ class SparseController:
                 # Q 的头数除以 world_size: TP 分片后每 rank 只持有 N/tp 个头
                 num_heads = self.config.hf_config.num_attention_heads // self.config.tensor_parallel_size
                 # 最长序列的 KV 长度，也是 attn_score 张量的最后一维（padding 到一致）
-                if is_prefill:
-                    max_len = int(state.context_lens.max().item())
-                else:
-                    max_len = self.cache_manager.decode_attn_score_max_len(i, state.context_lens)
+                max_len = int(state.context_lens.max())
 
                 # attn_score 初始填充值:
                 #   prefill: 0.0 — 还没计算，初始为0，token加入后被真实分数覆盖
@@ -162,13 +159,6 @@ class SparseController:
     @torch.no_grad()
     def post_forward(self, seqs: list[Sequence], is_prefill: bool):
         """持久化压缩 (如 SnapKV / DeltaKV)"""
-        if self.sparse_method == 'attnpredict-offload':
-            if is_prefill:
-                self.cache_manager.on_prefill_step_end()
-            else:
-                self.cache_manager.on_decode_step_end()
-            return
-
         if get_context().is_long_text is False and not self.is_deltakv_family:
             return
 

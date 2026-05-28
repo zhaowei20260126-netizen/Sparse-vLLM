@@ -205,7 +205,7 @@ class Attention(nn.Module):
                 b_seq_len = layer_context_lens                     # 每个序列实际可见的 KV 长度
                 b_prompt_cache_len = b_seq_len - chunk_lens        # 每个序列的历史 KV 长度
                 max_input_len = b_seq_len.max().item()
-
+ 
                 prefill_attn_score_block_size = None
                 prefill_attn_score = cache_manager.prepare_prefill_predictor_inputs(
                     context.now_layer_idx,

@@ -560,8 +560,8 @@ _predict_decode_batch_and_prefetch_worker(items)
 当前代码里 `config.py` 的默认值是：
 
 ```text
-attnpredict_reuse_steps = 100000
-attnpredict_max_stale_steps = 100000
+attnpredict_reuse_steps = 4
+attnpredict_max_stale_steps = 6
 ```
 
 这几乎等价于：
