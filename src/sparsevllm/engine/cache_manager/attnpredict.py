@@ -59,7 +59,7 @@ class AttnPredictCacheManager(StandardCacheManager):
         model_path = str(config.attnpredict_model_path or "")
         state_dict = torch.load(model_path, map_location="cuda", weights_only=False)
         self.cnn.load_state_dict(state_dict) # cnn模型占gpu的2MB显存，很小
-        self.cnn.to(dtype=torch.float16, device="cuda")
+        self.cnn.to(dtype=torch.float16, device="cuda", memory_format=torch.channels_last)
         self.cnn.eval()
         self.cnn_dtype = next(self.cnn.parameters()).dtype
 

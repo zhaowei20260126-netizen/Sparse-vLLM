@@ -421,6 +421,10 @@ class CacheManager(ABC):
         """decode 是否需要收集 attention score；默认保持每步收集。"""
         return True
 
+    def decode_attn_score_max_len(self, layer_idx: int, context_lens: torch.Tensor) -> int:
+        """返回 decode attn_score 宽度；默认覆盖完整 context。"""
+        return int(context_lens.max().item())
+
     def build_decode_view(
         self,
         layer_idx: int,

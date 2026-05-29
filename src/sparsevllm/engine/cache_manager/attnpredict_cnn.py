@@ -14,16 +14,15 @@ class AttnPredictCNN(nn.Module):
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(3, 3), padding=1)
         self.relu = nn.ReLU()
         self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=(3, 3), padding=1)
-        self.pool = nn.AdaptiveAvgPool2d((1, None))
         self.conv3 = nn.Conv1d(in_channels=32, out_channels=1, kernel_size=1)
 
     def forward(self, x):
-        # x: (batch_size, a, b) where a=history_steps, b=pooled_seq_len
-        x = x.unsqueeze(1)           # (batch_size, 1, a, b)
+        # x: (batch_size, a, b)，a=history_steps，b=pooled_seq_len
+        x = x.unsqueeze(1).contiguous(memory_format=torch.channels_last) # Conv2d 用 NHWC，减少 layout 转换
         x = self.relu(self.conv1(x)) # (batch_size, 16, a, b)
         x = self.relu(self.conv2(x)) # (batch_size, 32, a, b)
-        x = self.pool(x)             # (batch_size, 32, 1, b)
-        x = x.squeeze(2)             # (batch_size, 32, b)
+        x = x.mean(dim=2, keepdim=True) # (batch_size, 32, 1, b)
+        x = x.squeeze(2).contiguous() # Conv1d 输入保持 (batch_size, 32, b) 连续布局
         x = self.conv3(x)            # (batch_size, 1, b)
         x = x.squeeze(1)             # (batch_size, b)
         return x

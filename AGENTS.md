@@ -64,3 +64,5 @@ This repository includes a repo-local Codex skill.
 ## 交互要求
 - Thinking思考过程用中文表述
 - Reply回答也要用中文回复
+## 环境要求
+- 使用虚拟环境 .venv，不要使用系统环境下的python包。

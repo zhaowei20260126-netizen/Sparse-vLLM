@@ -134,8 +134,12 @@ class SparseController:
                 batch_size = len(seqs)
                 # Q 的头数除以 world_size: TP 分片后每 rank 只持有 N/tp 个头
                 num_heads = self.config.hf_config.num_attention_heads // self.config.tensor_parallel_size
-                # 最长序列的 KV 长度，也是 attn_score 张量的最后一维（padding 到一致）
-                max_len = int(state.context_lens.max())
+                # decode 可由 cache manager 收窄 score buffer 宽度。
+                max_len = (
+                    int(state.context_lens.max())
+                    if is_prefill
+                    else self.cache_manager.decode_attn_score_max_len(i, state.context_lens)
+                )
 
                 # attn_score 初始填充值:
                 #   prefill: 0.0 — 还没计算，初始为0，token加入后被真实分数覆盖
