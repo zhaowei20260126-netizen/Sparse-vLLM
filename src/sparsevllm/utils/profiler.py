@@ -47,7 +47,9 @@ class Profiler:
         if self.cuda_sync:
             torch.cuda.synchronize()
         t1 = time.perf_counter()  # perf_counter 精度最高，不受系统时间调整影响
-        yield
+        # profiler 打开时给 nsys 时间线补 NVTX 名称。
+        with torch.cuda.nvtx.range(name):
+            yield
         # 再次同步 GPU 流，确保被测代码块的 kernel 也执行完成
         if self.cuda_sync:
             torch.cuda.synchronize()

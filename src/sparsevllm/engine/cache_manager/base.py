@@ -425,6 +425,10 @@ class CacheManager(ABC):
         """返回 decode attn_score 宽度；默认覆盖完整 context。"""
         return int(context_lens.max().item())
 
+    def decode_view_max_len(self, layer_idx: int, context_lens: torch.Tensor) -> int:
+        """返回 decode packed view 的最大可见长度；默认从 GPU lens 读取。"""
+        return int(context_lens.max().item())
+
     def build_decode_view(
         self,
         layer_idx: int,

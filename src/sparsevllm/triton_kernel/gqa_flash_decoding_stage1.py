@@ -173,13 +173,13 @@ def _fwd_kernel_flash_decode_stage1_with_score(
         att_value = tl.where(offs_n_new[None, :] < cur_batch_end_index, att_value, float("-inf"))
         
         # Store Attn Score (3D)
-        off_as = (cur_batch * stride_asbs + 
-                  cur_q_head_range[:, None] * stride_ash + 
+        off_as = (cur_batch * stride_asbs +
+                  cur_q_head_range[:, None] * stride_ash +
                   offs_n_new[None, :] * stride_asl)
-        tl.store(Attn_Score + off_as, att_value, 
-                 mask=(cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size) & 
+        tl.store(Attn_Score + off_as, att_value,
+                 mask=(cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size) &
                       (offs_n_new[None, :] < cur_batch_end_index))
-        
+
         att_value *= sm_scale
         v = tl.load(V + k_loc[:, None] * stride_kbs + cur_kv_head * stride_kh + offs_d[None, :],
                     mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0)

@@ -260,7 +260,7 @@ class Attention(nn.Module):
                     num_kv_heads=self.num_kv_heads,
                 )
                 # 算本 batch 里最长的可见 KV 长度
-                max_len_in_batch = layer_context_lens.max().item()
+                max_len_in_batch = cache_manager.decode_view_max_len(context.now_layer_idx, layer_context_lens)
                 BLOCK_SEQ = 256 # decode kernel 会把 KV 序列按块处理，每块 256 个 token
                 # mid_o 存每个 KV block 算出来的局部 attention 输出
                 #  [batch_size, num_heads, num_blocks, head_dim]

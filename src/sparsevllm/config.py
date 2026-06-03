@@ -47,8 +47,8 @@ class Config:
     attnpredict_history_steps: int = 64
     attnpredict_pooling_block_size: int = 16
     attnpredict_model_path: str = ""
-    attnpredict_reuse_steps: int = 4
-    attnpredict_max_stale_steps: int = 6
+    attnpredict_reuse_steps: int = 16
+    attnpredict_max_stale_steps: int = 16
     attnpredict_offload_prefetch: bool = True
     attnpredict_offload_cpu_threads: int = 8
     attnpredict_offload_cpu_slots: int = -1
