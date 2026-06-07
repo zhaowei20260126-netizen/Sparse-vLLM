@@ -376,10 +376,10 @@ class AttnPredictCacheManager(StandardCacheManager):
         attn_pooling: torch.Tensor,
     ) -> torch.Tensor:
         """滚动更新已经池化的 block 级 attention 历史窗口。"""
-        if attn_pooling.shape[-2] > self.history_step:
+        if attn_pooling.shape[-2] > self.history_step: #TODO: 又是兜底检查代码，前面都已经检查过了，这就不需要检查了。
             attn_pooling = attn_pooling[:, -self.history_step:, :]
 
-        if attn_history is None:
+        if attn_history is None: #TODO：由
             # 首次记录：不足 history_step 则在前面 pad 0
             if attn_pooling.shape[-2] < self.history_step: # 如果最后一个chunk 的大小小于 history_step, 则在前面 pad 0。或者本省q总数小于 history_step
                 pad_rows = self.history_step - attn_pooling.shape[-2]

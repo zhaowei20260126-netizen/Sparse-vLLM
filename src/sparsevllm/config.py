@@ -49,7 +49,6 @@ class Config:
     attnpredict_model_path: str = ""
     attnpredict_reuse_steps: int = 16
     attnpredict_max_stale_steps: int = 16
-    attnpredict_offload_prefetch: bool = True
     attnpredict_offload_cpu_threads: int = 8
     attnpredict_offload_cpu_slots: int = -1
     attnpredict_offload_cpu_memory_utilization: float = 0.70

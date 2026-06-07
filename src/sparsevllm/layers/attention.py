@@ -221,7 +221,7 @@ class Attention(nn.Module):
                 )
                 if prefill_attn_score is not None:
                     layer_attn_score = prefill_attn_score
-                    prefill_attn_score_block_size = cache_manager.prefill_attn_score_block_size(
+                    prefill_attn_score_block_size = cache_manager.prefill_attn_score_block_size( 
                         context.now_layer_idx
                     )
 
