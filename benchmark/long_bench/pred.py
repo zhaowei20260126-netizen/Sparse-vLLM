@@ -443,6 +443,7 @@ if __name__ == '__main__':
 
     if args.worker_rank < 0:
         # 记录评测信息到日志文件
+        os.makedirs(BASE_PATH, exist_ok=True)
         log_path = os.path.join(BASE_PATH, "longbench_eval.log")
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")

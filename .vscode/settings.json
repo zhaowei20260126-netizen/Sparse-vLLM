@@ -1,0 +1,9 @@
+{
+    "git.ignoreLimitWarning": true,
+    "remote.extensionKind": {
+        "GitHub.copilot": ["ui"],
+        "GitHub.copilot-chat": ["ui"],
+        "pub.name": ["ui"]
+    }
+}
+

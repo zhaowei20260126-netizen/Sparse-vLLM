@@ -1,0 +1,11 @@
+{
+    "qasper": 44.46,
+    "hotpotqa": 55.52,
+    "multi_news": 27.25,
+    "category_scores": {
+        "SDQA": 44.46,
+        "MDQA": 55.52,
+        "SUM": 27.25
+    },
+    "overall_category_avg": 42.41
+}

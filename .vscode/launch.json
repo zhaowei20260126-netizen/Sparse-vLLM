@@ -67,6 +67,37 @@
       "justMyCode": false
     },
     {
+      "name": "Debug attnpredict-offload (10k bs=2)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "program": "${workspaceFolder}/scripts/bench_sparse_vllm.py",
+      "args": [
+        "--model_path",
+        "${workspaceFolder}/models/llama-3.1-8B-Instruct",
+        "--lengths",
+        "10000",
+        "--batch_sizes",
+        "2",
+        "--methods",
+        "attnpredict-offload",
+        "--output_len",
+        "64",
+        "--temperature",
+        "0.0",
+        "--hyper_params",
+        "{\"gpu_memory_utilization\":0.7,\"chunk_prefill_size\":4096,\"tensor_parallel_size\":1,\"attnpredict_model_path\":\"${workspaceFolder}/predictor/CNN_llama3.1_alltask_5case/best_model.pth\",\"attnpredict_history_steps\":64,\"attnpredict_pooling_block_size\":16,\"attnpredict_reuse_steps\":16,\"attnpredict_max_stale_steps\":16,\"attnpredict_offload_cpu_threads\":8,\"attnpredict_offload_cpu_slots\":-1,\"attnpredict_offload_cpu_memory_utilization\":0.70,\"attnpredict_offload_pin_staging\":true,\"num_top_tokens\":4096,\"num_sink_tokens\":64,\"num_recent_tokens\":512}"
+      ],
+      "env": {
+        "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/src"
+      },
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true
+    },
+    {
       "name": "Debug trace_qkv_similarity_longbench (smoke)",
       "type": "debugpy",
       "request": "launch",

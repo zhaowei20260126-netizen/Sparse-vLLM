@@ -32,6 +32,24 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
     注意：这里刻意不调用 ``StandardCacheManager.__init__``。标准 cache manager 假设
     “每个 token 在 GPU 上长期占一个 slot”，而 offload 版本需要 per-layer active pool
     和 CPU full backing 两套元数据，所以只复用基类的模型尺寸/配置初始化。
+
+    decode lease 状态机（理解本文件最关键的一段）：
+    一份 lease 是“某段连续 decode step 内可复用的预测结果”，由四组 per-layer 状态构成，
+    生命周期分四步，跨多个函数：
+      1. predict：source layer attention 结束后，``predict_next_mask()`` 把 softmax/CNN/top-k
+         丢到后台线程，算出新的 hot positions。组内其余层复用 source layer 的结果。
+      2. prefetch：后台 worker 调 ``_ensure_positions_loaded()`` 只把缺失 KV 从 CPU 加载到
+         GPU active pool（只加载、不释放旧 resident），完成后记录一个 CUDA event。
+      3. commit：下一次同层消费时 ``_consume_prefetch()`` 等 event，再 ``_commit_lease()``
+         把新结果写进 ``_lease_hot_positions``/``_lease_start_positions``，并失效
+         ``_static_view_cache``（因为 sink+hot 集合变了）。decode worker 还会置
+         ``_pending_residency_cleanup=True``。
+      4. cleanup：每层下一次 ``get_layer_store_view()`` 到达自身写入点时，才用
+         ``_ensure_positions_resident()`` 驱逐旧 lease 不再需要的 resident（dirty token
+         驱逐前先 D2H 写回 CPU backing）。这样驱逐成本分摊到各层，不在 step 开头集中爆发。
+    相关状态：``_lease_hot_positions``（当前复用的 hot positions）、``_lease_start_positions``
+    （row -> lease 起始 decode 位置，用于算 lease 年龄）、``_static_view_cache``（lease 内
+    稳定的 sink+hot slots 缓存）、``_dirty_gpu_positions``（GPU 有、CPU backing 未写回的新 KV）。
     """
 
     def __init__(self, config: Config, rank: int, world_size: int):
@@ -111,8 +129,8 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         self._reuse_steps = config.attnpredict_reuse_steps
         # 后台预测过慢时最多复用几步旧 lease。
         self._max_stale_steps = config.attnpredict_max_stale_steps
-        # 每 4 层复用组首层 predictor 结果。
-        self._layer_reuse_stride = 4
+        # 每隔多少层复用组首层 predictor 结果；与 reuse/max_stale 同为核心消融旋钮。
+        self._layer_reuse_stride = config.attnpredict_layer_reuse_stride
 
         # AttentionPredictor 算法状态与普通 attnpredict 完全一致，复用父类 helper。
         # StandardCacheManager 的全局 GPU slot 结构，和 offload 的 per-layer active pool 冲突。
@@ -142,20 +160,20 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         # ------------------------------------------------------------------
         # 异步预取资源
         # ------------------------------------------------------------------
-        # 后台 CPU 线程负责提交 predictor/prefetch 任务；每层一个 CUDA stream，
-        # 用于让预测和 H2D 拷贝尽量与主计算流 overlap。
+        # 后台 CPU 线程负责提交 predictor/prefetch 任务；单条 CUDA stream
+        # 避免多组 predictor/H2D 并发抢占主计算流。
         cpu_threads = config.attnpredict_offload_cpu_threads or 1
         # 控制 CPU 侧 PyTorch 算子线程数，不影响 GPU kernel 线程数。
         torch.set_num_threads(cpu_threads)
         self._pin_staging = bool(config.attnpredict_offload_pin_staging)
         # 后台线程池负责提交 predictor、prefetch 和 CPU residency 任务。
         self._prefetch_executor = ThreadPoolExecutor(max_workers=cpu_threads)
-        # 单条默认优先级预测流，避免多层 predictor 并发抢占主计算流。
         self._prefetch_stream = torch.cuda.Stream(priority=0)
-        self._prefetch_streams = [self._prefetch_stream for _ in range(self.num_layers)]
         # 每层一个 future 句柄；结果可能覆盖组内多个 layer。
         self._prefetch_futures: list[Future | None] = [None for _ in range(self.num_layers)]
         # 异步 decode 切到新 lease 后，各层到达自身写入点时再释放旧 resident。
+        # 由 decode worker 返回的 needs_cleanup 触发：_consume_prefetch 据此置位，
+        # 再由 get_layer_store_view 在该层到达写入点时执行旧 resident 驱逐。
         self._pending_residency_cleanup = [False for _ in range(self.num_layers)]
         self._pending_prefill_views: list[dict[str, object] | None] = [None for _ in range(self.num_layers)]
         # 主线程和后台线程都会改同层 active pool 元数据。
@@ -487,8 +505,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
                 for row_idx, positions in row_positions.items():
                     full_len = self.row_seq_lens[row_idx]
 
-                    # 清理非法位置并去重，避免重复分配或访问越界。
-                    # positions = np.asarray(positions, dtype=np.int64)
+                    # 清理非法位置，避免重复分配或访问越界。positions 由调用方传入已是 np.int64 ndarray。
                     positions = positions[(positions >= 0) & (positions < full_len)]
                     positions_list = positions.tolist()
                     target = set(positions_list)
@@ -739,8 +756,14 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         self,
         layer_results: dict[int, dict[str, dict[int, np.ndarray] | dict[int, int]]],
     ) -> None:
-        """提交组内各层 lease。"""
-        for layer_idx, result in layer_results.items(): #TODO：既然复用层组里的lease一样，直接赋值不就可以了，为什么还要单独循环，循环里的步骤都是一模一样的，除了layer_idx不一样
+        """提交组内各层 lease。
+
+        组内每层共享同一份 hot_positions/lease_starts 对象，但不能直接赋值给
+        各层 lease：_commit_lease() 对每层的 _lease_hot_positions[layer_idx] 做
+        update() 合并（保留该层仍在 decode 的其他 row），并失效各自独立的
+        _static_view_cache[layer_idx]。这些都是 per-layer 状态，必须逐层提交。
+        """
+        for layer_idx, result in layer_results.items():
             self._commit_lease(layer_idx, result["hot_positions"], result["lease_start_positions"])
 
     def _get_packed_slots_buffer(self, layer_idx: int, batch_size: int, max_keep: int, device: torch.device) -> torch.Tensor:
@@ -768,31 +791,26 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         return cached[:batch_size]
 
     def _consume_prefetch(self, layer_idx: int, *, wait: bool) -> bool:
-        """消费后台预测；wait=False 时没完成就继续使用旧 lease。
-        没有后台任务：consumed=False，继续用旧 lease
-        后台没完成，且没到 max_stale：consumed=False，继续用旧 lease
-        后台完成了：consumed=True，切换到新 lease
+        """消费本层后台预测结果，返回是否真正切到新 lease。
+
+        三态：无后台任务 / 后台未完成且 wait=False -> 返回 False，继续用旧 lease；
+        后台完成（或 wait=True 强等）-> 提交新 lease 并返回 True。
+
+        注意：每层各自持有独立 future（predict_next_mask/on_prefill_layer_end 每层单独
+        submit），所以这里只需清空本层的 future 槽位。
         """
         future = self._prefetch_futures[layer_idx]
-        if future is None: # 如果这一层没有后台任务，直接返回 False，表示没有新预测结果可消费
-            return False 
+        if future is None:
+            return False
         if not wait and not future.done():
-            return False # # decode 正常步不会强等后台预测。如果还没完成，就返回 False，继续用旧预测结果。
-        with profiler.record("attnpredict_offload_prefetch_wait"):#真正消费的新lease的地方
-            result = future.result() # {"event": done,  "layer_results": layer_results }
-            # for i, known_future in enumerate(self._prefetch_futures):
-            #     if known_future is future:
-            #         self._prefetch_futures[i] = None #  跨层复用时，多个 layer 可能共享同一个 future。这里把所有指向同一个 future 的槽位清空，避免后面重复消费同一个后台结果
+            return False
+        with profiler.record("attnpredict_offload_prefetch_wait"):
+            result = future.result()
             self._prefetch_futures[layer_idx] = None
-            marker = (
-                "attnpredict_offload_prefetch_event_ready"
-                if result["event"].query() # event.query() 是检查 GPU event 是否已经完成。如果返回 True，说明后台 stream 上的 GPU 工作已经做完
-                else "attnpredict_offload_prefetch_event_pending"
-            )
-            with profiler.record(marker):
-                pass
-            torch.cuda.current_stream().wait_event(result["event"])#当前主计算流要等后台 event，确保后面 decode 真正读取 KV 之前，后台搬运到 GPU 的 KV 已经可用。
-            self._commit_layer_results(result["layer_results"])#把新预测结果提交为当前 lease
+            # 主计算流等后台 event，保证 decode 读 KV 前后台搬运已落地。
+            torch.cuda.current_stream().wait_event(result["event"])
+            self._commit_layer_results(result["layer_results"])
+            # decode worker 用 release_old=False 只补缺，旧 resident 留到各层写入点再清理。
             if result.get("needs_cleanup", False):
                 for cleanup_layer_idx in result["layer_results"]:
                     self._pending_residency_cleanup[cleanup_layer_idx] = True
@@ -820,11 +838,21 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         return False
 
     def should_collect_decode_attn_score(self, layer_idx: int) -> bool:
-        """每 4 步刷新一次；后台未完成时继续复用旧 lease。"""
+        """是否本步在该层收集 attention score 以触发新一轮预测。
+
+        时序约束：本方法由 SparseController.prepare_forward() 在每个 decode step
+        开头一次性遍历所有层调用，副作用 self._collect_decode_positions[layer_idx]
+        会在该层真正 forward 时被 build_decode_view() 读取。判断里用到的
+        self._prefetch_futures[layer_idx] 是 step 开头的快照——这要求 source layer
+        的 future 在一个 step 内不会中途被清空。当前成立：future 只在上一 step 末尾
+        提交、本 step 该层 get_layer_store_view() 才消费，prepare_forward 阶段不消费。
+        若以后改动消费时机，需重新核对这里的一致性。
+        """
         collect = False
         if not self._is_layer_reuse_source(layer_idx):
             self._collect_decode_positions[layer_idx] = collect
             return collect
+        # future 仍在 -> 上一轮预测尚未消费，本步继续复用旧 lease，不重复收集。
         if self._prefetch_futures[layer_idx] is None and not self._lease_missing_decode_rows(layer_idx):
             collect = self._lease_age_reached(layer_idx, self._reuse_steps)
         self._collect_decode_positions[layer_idx] = collect
@@ -848,9 +876,6 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         - prefill：所有 token 已经在 _prepare_prefill 中分配好 GPU slots，直接返回。
         - decode：到达某一层时，才等待该层上一轮 prefetch；然后直接消费
           predictor 已保存的下一步 positions；最后给当前新 token 分配本层 GPU slot。
-
-        这样不会在 decode step 一开始就等待所有层的预取，而是让前面层的计算
-        和后面层的后台预取自然 overlap。
         """
         ctx = get_context()
         if not ctx.is_prefill:
@@ -924,8 +949,9 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
 
         prefill 立即写 CPU；decode 只标记 dirty，驱逐前再写回，减少每步 D2H。
         """
-        
         if not get_context().is_prefill:
+            # decode dirty 只按逻辑 (row, pos) 标记，与本层物理 slot_mapping 无关：
+            # 同一 step 内各层的 row/pos 集合相同（同一 batch），驱逐时再按 row/pos 查 slot 写回。
             with self._layer_locks[layer_idx]:
                 dirty = self._dirty_gpu_positions[layer_idx]
                 for row_idx, pos in zip(self._decode_rows.tolist(), self._decode_current_positions.tolist()):
@@ -1244,7 +1270,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         确认本层 active pool 已经准备好。
         """
         torch.cuda.set_device(attn_logits.device)
-        stream = self._prefetch_streams[layer_idx]
+        stream = self._prefetch_stream
         with torch.inference_mode(), torch.cuda.stream(stream):
             # 必须等主 stream 的 attention kernel 写完 attn_logits。
             stream.wait_event(attention_done_event)
@@ -1273,7 +1299,7 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
         """后台任务：prefill 最后一块结束后初始化 predictor，并准备首个 decode active set。"""
         tail_score = view["tail_score"]
         torch.cuda.set_device(tail_score.device)
-        stream = self._prefetch_streams[layer_idx]
+        stream = self._prefetch_stream
         with torch.inference_mode(), torch.cuda.stream(stream):
             stream.wait_event(attention_done_event)
             with profiler.record("attnpredict_offload_prefill_predict_stream"):
@@ -1520,9 +1546,13 @@ class AttnPredictOffloadCacheManager(AttnPredictCacheManager):
     def free_seq(self, seq_id: int):
         """释放某个序列占用的 GPU active slots、CPU full slots 和 predictor 状态。"""
         row_idx = self.seq_id_to_row.pop(seq_id)
+        # 先把所有层的后台任务全部消费完，再统一清理。两阶段分开的原因：
+        # _wait_prefetch 消费 source layer 的 future 时，_commit_layer_results 会
+        # 把跨层结果提交到整个复用组（含尚未清理的层），其 _commit_lease 会向正在
+        # 释放的 row 写回 lease。若边等边清，后等到的 commit 会复活已清理层的 row。
         for layer_idx in range(self.num_layers):
-            # 释放前先等后台任务结束，避免后台还在访问这个 row 的映射或 slot。
             self._wait_prefetch(layer_idx)
+        for layer_idx in range(self.num_layers):
             lease_hot_positions = self._lease_hot_positions[layer_idx]
             if lease_hot_positions is not None:
                 lease_hot_positions.pop(row_idx, None)

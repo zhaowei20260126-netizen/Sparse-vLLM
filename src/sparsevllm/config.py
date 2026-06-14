@@ -49,6 +49,7 @@ class Config:
     attnpredict_model_path: str = ""
     attnpredict_reuse_steps: int = 16
     attnpredict_max_stale_steps: int = 16
+    attnpredict_layer_reuse_stride: int = 4  # 每隔多少层重新跑一次 predictor，组内其余层复用首层结果
     attnpredict_offload_cpu_threads: int = 8
     attnpredict_offload_cpu_slots: int = -1
     attnpredict_offload_cpu_memory_utilization: float = 0.70
@@ -199,6 +200,8 @@ class Config:
             if self.attnpredict_max_stale_steps < self.attnpredict_reuse_steps:
                 raise ValueError("attnpredict_max_stale_steps 必须 >= attnpredict_reuse_steps")
             if self.vllm_sparse_method == "attnpredict-offload":
+                if self.attnpredict_layer_reuse_stride < 1:
+                    raise ValueError("attnpredict_layer_reuse_stride 必须 >= 1")
                 if self.attnpredict_offload_cpu_threads < 1:
                     raise ValueError("attnpredict_offload_cpu_threads 必须 >= 1")
                 if self.attnpredict_offload_cpu_slots == 0 or self.attnpredict_offload_cpu_slots < -1:

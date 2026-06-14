@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write Optimization Tech Doc"
+  short_description: "Create concise optimization technical docs"
+  default_prompt: "Create a concise Markdown technical document for this optimization point, with clear mechanism, scope, benefits, and observed results."

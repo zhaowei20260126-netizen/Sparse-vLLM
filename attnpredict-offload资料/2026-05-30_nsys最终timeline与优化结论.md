@@ -1254,3 +1254,641 @@ smoke 结果：`16k / bs=1 / output_len=8`
 一旦存在就会更容易触发强制消费，降低跨步复用隐藏 predictor/prefetch 的空间。
 因此该组合不采纳为默认性能配置。质量上它理论上比 `16/16` 更新更积极，但仍需另跑
 LongBench 才能判断是否值得用吞吐换质量。
+
+## Source layer 组级独立异步 stream 实验
+
+用户希望验证待做清单中的“每个跨层复用组使用独立 prefetch stream”是否能进一步提速。当前稳定实现为所有 source layer 共用一条默认优先级 stream；本实验临时改成：
+
+```text
+layer 0/1/2/3   -> stream0
+layer 4/5/6/7   -> stream4
+layer 8/9/10/11 -> stream8
+...
+```
+
+即 `layer_reuse_stride=4` 时一共创建 `8` 个 source layer 组级 stream。实验不新增配置项，只临时修改 `src/sparsevllm/engine/cache_manager/attnpredict_offload.py` 初始化 `_prefetch_streams` 的方式。
+
+语法检查：
+
+```bash
+.venv/bin/python -m py_compile src/sparsevllm/engine/cache_manager/attnpredict_offload.py
+```
+
+smoke 命令：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+ATTNPREDICT_MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth \
+LENGTHS=4096 BATCH_SIZES=1 OUTPUT_LEN=4 GPU_MEMORY_UTILIZATION=0.7 \
+bash scripts/bench_attnpredict_vs_vanilla_128k.sh
+```
+
+smoke 通过，日志确认：
+
+```text
+prefetch_stream_groups=8
+```
+
+目标命令：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+ATTNPREDICT_MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth \
+LENGTHS=128000 BATCH_SIZES=2 OUTPUT_LEN=64 GPU_MEMORY_UTILIZATION=0.7 \
+ATTNPREDICT_REUSE_STEPS=16 ATTNPREDICT_MAX_STALE_STEPS=16 \
+bash scripts/bench_attnpredict_vs_vanilla_128k.sh
+```
+
+目标结果：`128k / bs=2 / output_len=64`
+
+| method | TTFT | PreTP | DecTP | ITL | Mem | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vanilla | 42.78s | 5984.8 tok/s | 46.81 tok/s | 42.73ms | 66.49GB | 1.00x |
+| attnpredict-offload 组级 stream | 54.76s | 4675.2 tok/s | 51.80 tok/s | 38.61ms | 48.64GB | 1.11x |
+
+对比当前单 stream 最新同机结果：
+
+| 版本 | TTFT | DecTP |
+| --- | ---: | ---: |
+| 单 stream 稳定实现 | 51.42s | 52.33 tok/s |
+| 组级 stream 实验 | 54.76s | 51.80 tok/s |
+
+结论：组级独立 stream 没有带来提速，DecTP 低于当前单 stream 稳定实现，TTFT 也明显变慢。该结果符合此前判断：更多 stream 可能减少 source layer 排队，但也会增加 predictor/H2D 与主计算流之间的资源竞争。根据 `python-code-slim`，该实验不采纳，代码已回退到单 stream 实现。
+
+## GPU 计算争夺 vs 带宽争夺诊断
+
+本轮目标是区分 `attnpredict-offload` 的额外开销主要来自：
+
+- GPU compute contention（GPU 计算资源争夺，即 predictor 相关 kernel 与主模型 kernel 同时占用 SM 计算单元）
+- bandwidth contention（带宽争夺，即 H2D/D2H 拷贝、GPU active pool 写入、显存读写与主计算共享 PCIe/显存带宽）
+
+### 实验命令
+
+Nsight Systems 目标配置：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+ATTNPREDICT_MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth \
+LENGTHS=128000 BATCH_SIZES=2 OUTPUT_LEN=64 GPU_MEMORY_UTILIZATION=0.7 \
+ATTNPREDICT_REUSE_STEPS=16 ATTNPREDICT_MAX_STALE_STEPS=16 \
+/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys profile \
+  --trace=cuda,nvtx,osrt --cuda-memory-usage=true --sample=none --force-overwrite=true \
+  -o profiler_outputs/nsys_contention_r16_s16_bs2_128k_o64 \
+  bash scripts/bench_attnpredict_vs_vanilla_128k.sh
+```
+
+带项目 profiler 的短 trace：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+ATTNPREDICT_MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth \
+LENGTHS=128000 BATCH_SIZES=2 OUTPUT_LEN=16 GPU_MEMORY_UTILIZATION=0.7 \
+ATTNPREDICT_REUSE_STEPS=16 ATTNPREDICT_MAX_STALE_STEPS=16 \
+PROFILER_SVLLM=1 CUDA_SYNC_SVLLM=0 EXTRA_HYPER_PARAMS_JSON='{"enable_profiler":true}' \
+/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys profile \
+  --trace=cuda,nvtx,osrt --cuda-memory-usage=true --sample=none --force-overwrite=true \
+  -o profiler_outputs/nsys_contention_nvtx_r16_s16_bs2_128k_o16 \
+  bash scripts/bench_attnpredict_vs_vanilla_128k.sh
+```
+
+项目 profiler 正常配置：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+PROFILER_SVLLM=1 CUDA_SYNC_SVLLM=0 \
+.venv/bin/python scripts/bench_sparse_vllm.py \
+  --model_path /root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+  --methods attnpredict-offload --lengths 128000 --batch_sizes 2 --output_len 64 \
+  --hyper_params '{"gpu_memory_utilization":0.7,"chunk_prefill_size":4096,"tensor_parallel_size":1,"attnpredict_model_path":"/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth","attnpredict_history_steps":64,"attnpredict_pooling_block_size":16,"attnpredict_reuse_steps":16,"attnpredict_max_stale_steps":16,"attnpredict_offload_cpu_threads":8,"attnpredict_offload_cpu_slots":-1,"attnpredict_offload_cpu_memory_utilization":0.7,"attnpredict_offload_pin_staging":true,"num_top_tokens":4096,"num_sink_tokens":64,"num_recent_tokens":512,"enable_profiler":true}'
+```
+
+### 结果
+
+Nsight Systems 目标配置结果：
+
+| method | TTFT | PreTP | DecTP | ITL | Mem |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vanilla | 42.65s | 6002.1 tok/s | 45.54 tok/s | 43.91ms | 66.46GB |
+| attnpredict-offload | 65.66s | 3898.7 tok/s | 46.69 tok/s | 42.83ms | 48.64GB |
+
+> `nsys` 本身会显著扰动吞吐，尤其是 offload 的 prefill。这里主要看事件分布，不把该吞吐作为最终性能结论。
+
+Nsight Systems MemOps 统计：
+
+| 类型 | 次数 | 总时间 | 数据量 |
+| --- | ---: | ---: | ---: |
+| Device-to-Host | 5670 | 15.24s | 约 32.95GiB |
+| Host-to-Device | 5492 | 7.49s | 统计表未直接列总量 |
+| Device-to-Device | 9946 | 0.009s | 很小 |
+
+带 NVTX 的短 trace 中，`attnpredict-offload` 关键区间：
+
+| 区间 | 调用次数 | 平均耗时 | 总耗时 |
+| --- | ---: | ---: | ---: |
+| `attnpredict_offload_store_cpu_full_kv` | 1216 | 52.29ms | 63.59s |
+| `attnpredict_offload_prefill_predict_stream` | 16 | 54.75ms | 0.88s |
+| `attnpredict_offload_residency_plan_cpu` | 64 | 8.13ms | 0.52s |
+| `attnpredict_offload_build_decode_view` | 480 | 0.179ms | 0.086s |
+| `attnpredict_offload_prefetch_wait` | 16 | 0.049ms | 0.001s |
+
+区间内 CUDA 事件聚合：
+
+| 区间 | GPU kernel 时间 | H2D 时间 | D2H 时间 | D2H 数据量 |
+| --- | ---: | ---: | ---: | ---: |
+| `store_cpu_full_kv` | 10.42s | 约 0s | 15.24s | 32.95GiB |
+| `prefill_predict_stream` | 0.27s | 约 0s | 0.001s | 0.025GiB |
+| `residency_plan_cpu` | 0.24s | 约 0s | 约 0s | 0.016GiB |
+| `build_decode_view` | 约 0s | 0.001s | 0s | 0 |
+
+> `store_cpu_full_kv` 总耗时远大于其中的 GPU kernel 和 D2H 时间，说明 prefill 阶段主要不是单纯 GPU 计算资源争夺，而是 GPU->CPU KV 拷贝、CPU backing 写入、同步和 Python 调度叠加。
+
+项目 profiler 正常配置结果：`128k / bs=2 / output_len=64`
+
+| 指标 | 数值 |
+| --- | ---: |
+| TTFT | 51.13s |
+| PreTP | 5007.1 tok/s |
+| DecTP | 52.45 tok/s |
+| ITL | 38.13ms |
+
+decode 关键开销：
+
+| 区间 | 调用次数 | 总耗时 |
+| --- | ---: | ---: |
+| `attnpredict_offload_build_decode_view` | 2016 | 0.348s |
+| `attnpredict_offload_predict_cnn_stream` | 24 | 0.340s |
+| `attnpredict_offload_topk` | 48 | 0.173s |
+| `attnpredict_offload_cnn` | 48 | 0.075s |
+| `attnpredict_offload_h2d_prefetch_stream` | 70 | 0.042s |
+| `attnpredict_offload_softmax` | 48 | 0.026s |
+| `attnpredict_offload_scatter_reduce` | 48 | 0.026s |
+| `attnpredict_offload_prefetch_wait` | 32 | 0.0017s |
+
+H2D 敏感性对照：`128k / bs=2 / output_len=64`
+
+| 配置 | TTFT | PreTP | DecTP | ITL |
+| --- | ---: | ---: | ---: | ---: |
+| pin staging = true | 51.57s | 4963.9 tok/s | 52.18 tok/s | 38.33ms |
+| pin staging = false | 52.06s | 4917.3 tok/s | 52.99 tok/s | 37.74ms |
+
+裸 PCIe bandwidth 脚本：
+
+| Size | H2D | D2H |
+| ---: | ---: | ---: |
+| 1024MB | 52.42GB/s | 53.36GB/s |
+| 2048MB | 52.55GB/s | 53.36GB/s |
+
+### Nsight Compute 限制
+
+尝试使用 Nsight Compute 做 roofline（屋顶线分析，即用硬件计数器判断 kernel 更接近算力瓶颈还是带宽瓶颈）：
+
+```bash
+/usr/local/cuda/bin/ncu --target-processes all --set roofline ...
+```
+
+结果报错：
+
+```text
+ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters
+```
+
+因此本轮不能给出 SM 利用率、DRAM 利用率、L2 throughput 这类硬件计数器结论，只能基于 Nsight Systems timeline、CUDA kernel/memcpy 时间和项目 profiler 做判断。
+
+### 结论
+
+1. prefill/TTFT 下降主要是带宽与 CPU backing 路径问题，不是纯 GPU 计算争夺。
+   `store_cpu_full_kv` 在 128k 下总耗时非常大，其中 D2H 已有约 15s，GPU kernel 约 10s，剩余大量时间来自 CPU backing 写入、同步和调度。这里的瓶颈更接近“数据搬运 + CPU 侧落盘 backing + 同步”。
+
+2. decode 阶段不是 H2D 等待主导。
+   正常 `output_len=64` 下，`prefetch_wait` 总计只有 1.7ms，`h2d_prefetch_stream` 总计约 42ms；这说明后台预取基本被跨步复用和异步流隐藏了，主流很少真正等 H2D event。
+
+3. decode 阶段剩余主要开销来自 predictor 计算和 packed view 构造。
+   `predict_cnn_stream` 总计约 340ms，`build_decode_view` 总计约 348ms。由于 predictor 在 GPU 上运行，确实会与主模型争用 SM/显存资源；但从当前数据看，它比 H2D wait 更像 decode 侧主要固定成本。
+
+4. pin staging 对 decode 吞吐影响不明显。
+   开启和关闭 pin staging 的 DecTP 分别为 52.18 和 52.99 tok/s，差异在运行波动范围内，不能证明 H2D 带宽是 decode 主瓶颈。
+
+当前最可信判断：`attnpredict-offload` 的 prefill 慢主要是 CPU backing/D2H 数据路径；decode 侧主要是 predictor GPU 计算、topk/softmax/pooling 和 packed view 构造等固定成本，H2D 预取等待不是主导瓶颈。若要继续优化 decode，应优先减少 predictor 刷新时的 GPU kernel 数量、降低 `build_decode_view()` 每层构造成本，而不是优先优化 pinned H2D。
+
+## Decode step 边界执行 predictor 实验
+
+实验目的：验证“小导建议”的一种直接实现，即不让 predictor 在某一层 attention 结束后立刻与后续 LLM 层重叠，而是等整个 decode step 的 LLM forward 结束后，再统一执行本步 predictor。
+
+实现方式：
+
+- 临时修改 `SparseController.on_attention_end()`：decode 阶段不再立即调用 `predict_next_mask()`。
+- 临时在 `SparseController.post_forward()` 的 decode step 末尾统一遍历本步 `attn_score`，调用 `predict_next_mask()`。
+- 临时增加 `finish_decode_step_predictors()`，在 step 末尾消费本步 source layer future，使下一步主模型开始前 predictor/prefetch 已经排到主流前面。
+
+> 该实验是“硬同步边界”版本，用来验证避免 predictor 和主模型层内重叠是否有收益；它不改变预测质量预算，`reuse_steps=16`、`max_stale_steps=16`、`layer_reuse_stride=4` 不变。
+
+语法检查：
+
+```bash
+.venv/bin/python -m py_compile \
+  src/sparsevllm/engine/sparse_controller.py \
+  src/sparsevllm/engine/cache_manager/attnpredict_offload.py
+```
+
+smoke 1：`4096 / bs=1 / output_len=4`
+
+| method | TTFT | DecTP | 结果 |
+| --- | ---: | ---: | --- |
+| vanilla | 0.19s | 8.43 tok/s | 通过 |
+| attnpredict-offload | 0.38s | 7.76 tok/s | 通过 |
+
+smoke 2：`4096 / bs=1 / output_len=20`，触发 `reuse=16` 的 decode 刷新。
+
+| 指标 | 数值 |
+| --- | ---: |
+| TTFT | 0.40s |
+| DecTP | 19.22 tok/s |
+| `attnpredict_offload_predict_cnn_stream` | 0.450s |
+| `model_sparse_post` | 0.120s |
+| `attnpredict_offload_prefetch_wait` | 0.059s |
+
+目标命令：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+ATTNPREDICT_MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth \
+LENGTHS=128000 BATCH_SIZES=2 OUTPUT_LEN=64 GPU_MEMORY_UTILIZATION=0.7 \
+ATTNPREDICT_REUSE_STEPS=16 ATTNPREDICT_MAX_STALE_STEPS=16 \
+bash scripts/bench_attnpredict_vs_vanilla_128k.sh
+```
+
+目标结果：`128k / bs=2 / output_len=64`
+
+| method | TTFT | PreTP | DecTP | ITL | Mem | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vanilla | 42.97s | 5957.9 tok/s | 46.61 tok/s | 42.91ms | 66.49GB | 1.00x |
+| attnpredict-offload step-boundary predictor | 51.30s | 4990.7 tok/s | 50.17 tok/s | 39.87ms | 48.67GB | 1.08x |
+
+项目 profiler 对比：
+
+| 区间 | 原稳定实现 | step-boundary 实验 |
+| --- | ---: | ---: |
+| DecTP | 约 52.33 tok/s | 50.17-50.74 tok/s |
+| `model_run_model_decode` | 约 2.29s | 约 2.00s |
+| `attnpredict_offload_predict_cnn_stream` | 约 0.34s | 约 2.17s |
+| `attnpredict_offload_prefetch_wait` | 约 0.0017s | 约 0.32s |
+| `attnpredict_offload_build_decode_view` | 约 0.35s | 约 0.28s |
+
+结论：
+
+1. 该实验验证了一个事实：把 predictor 移到 step 末尾后，主模型 decode 本身确实更干净，`model_run_model_decode` 从约 `2.29s` 降到约 `2.00s`。
+2. 但同步边界把原本可 overlap 的 predictor/prefetch 成本显式加回 step 尾部，`predict_cnn_stream` 和 `prefetch_wait` 明显变大，最终 DecTP 降到 `50.17-50.74 tok/s`。
+3. 因此“完全 step-boundary 同步 predictor”不采纳，实验代码已回退。
+
+后续更合理方向不是简单把 predictor 全同步到 step 末尾，而是做 deadline 调度：保留异步 overlap，但避免 predictor 在最密集的主模型层计算区间内立即抢占 GPU。
+
+## 严格等待预测完成 vs 放宽 stale 等待
+
+用户问题：是否可以“不设置 max_stale”，让当前第一个需要使用新预测结果的复用步严格等待前一个预测步完成，然后观察 DecTP 是否明显下降。
+
+代码语义确认：
+
+- 当前稳定配置是 `reuse_steps=16, max_stale_steps=16`。
+- source layer 在 lease age 达到 `reuse_steps=16` 时收集 score，并在 attention 结束后提交后台 predictor。
+- 下一步同层进入 `get_layer_store_view()` 时，旧 lease age 已经达到或超过 `max_stale_steps=16`，因此 `force_wait=True`。
+- 也就是说，`16/16` 已经是“第一个必须消费新 lease 的复用步严格等待后台预测”的配置。
+
+> 这里的 `max_stale_steps` 不是“预测间隔”，而是“后台预测还没完成时，最多允许旧 lease 继续被用多久”。当它等于 `reuse_steps` 时，基本就是严格等待；当它明显大于 `reuse_steps` 时，才会更宽松地继续使用旧 lease。
+
+诊断对照：只改 `max_stale_steps`，其它质量预算不变。
+
+严格等待：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+.venv/bin/python scripts/bench_sparse_vllm.py \
+  --model_path /root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+  --methods attnpredict-offload --lengths 128000 --batch_sizes 2 --output_len 64 \
+  --hyper_params '{"gpu_memory_utilization":0.7,"chunk_prefill_size":4096,"tensor_parallel_size":1,"attnpredict_model_path":"/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth","attnpredict_history_steps":64,"attnpredict_pooling_block_size":16,"attnpredict_reuse_steps":16,"attnpredict_max_stale_steps":16,"attnpredict_offload_cpu_threads":8,"attnpredict_offload_cpu_slots":-1,"attnpredict_offload_cpu_memory_utilization":0.7,"attnpredict_offload_pin_staging":true,"num_top_tokens":4096,"num_sink_tokens":64,"num_recent_tokens":512}'
+```
+
+放宽等待诊断：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+.venv/bin/python scripts/bench_sparse_vllm.py \
+  --model_path /root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+  --methods attnpredict-offload --lengths 128000 --batch_sizes 2 --output_len 64 \
+  --hyper_params '{"gpu_memory_utilization":0.7,"chunk_prefill_size":4096,"tensor_parallel_size":1,"attnpredict_model_path":"/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth","attnpredict_history_steps":64,"attnpredict_pooling_block_size":16,"attnpredict_reuse_steps":16,"attnpredict_max_stale_steps":64,"attnpredict_offload_cpu_threads":8,"attnpredict_offload_cpu_slots":-1,"attnpredict_offload_cpu_memory_utilization":0.7,"attnpredict_offload_pin_staging":true,"num_top_tokens":4096,"num_sink_tokens":64,"num_recent_tokens":512}'
+```
+
+结果：`128k / bs=2 / output_len=64`
+
+| 配置 | TTFT | PreTP | DecTP | ITL | Mem |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `reuse=16, max_stale=16` 严格等待 | 51.15s | 5005.1 tok/s | 52.25 tok/s | 38.28ms | 48.61GB |
+| `reuse=16, max_stale=64` 放宽等待诊断 | 51.14s | 5006.3 tok/s | 52.34 tok/s | 38.21ms | 48.62GB |
+
+结论：
+
+1. 严格等待和放宽等待的 DecTP 基本一致，差距只有 `0.09 tok/s`，属于运行波动范围。
+2. 因此“第一个复用步严格等待前一个预测步完成”不是当前 decode 吞吐下降的主要原因。
+3. 这与 profiler 结果一致：稳定 `16/16` 下 `attnpredict_offload_prefetch_wait` 总量非常小，后台预测和 H2D 基本已经在复用窗口内完成。
+4. `max_stale=64` 只作为诊断，不采纳为质量配置，因为它允许旧 lease 使用更久，可能增加预测陈旧风险。
+
+## Nsight Systems stream 重合度分析
+
+用户希望按时间线验证：当前预测步的异步 predictor 是否能在下一次同层消费前完成，以及后续没有预测开销的复用步是否会让主计算流变快。
+
+本轮使用现有 Nsight Systems 工具，不需要下载新工具。
+
+命令：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+PROFILER_SVLLM=1 CUDA_SYNC_SVLLM=0 \
+/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys profile \
+  --trace=cuda,nvtx,osrt --cuda-memory-usage=true --sample=none --force-overwrite=true \
+  -o profiler_outputs/nsys_overlap_attnpredict_r16_s16_bs2_128k_o64 \
+  .venv/bin/python scripts/bench_sparse_vllm.py \
+    --model_path /root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+    --methods attnpredict-offload --lengths 128000 --batch_sizes 2 --output_len 64 \
+    --hyper_params '{"gpu_memory_utilization":0.7,"chunk_prefill_size":4096,"tensor_parallel_size":1,"attnpredict_model_path":"/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth","attnpredict_history_steps":64,"attnpredict_pooling_block_size":16,"attnpredict_reuse_steps":16,"attnpredict_max_stale_steps":16,"attnpredict_offload_cpu_threads":8,"attnpredict_offload_cpu_slots":-1,"attnpredict_offload_cpu_memory_utilization":0.7,"attnpredict_offload_pin_staging":true,"num_top_tokens":4096,"num_sink_tokens":64,"num_recent_tokens":512,"enable_profiler":true}'
+```
+
+导出：
+
+```bash
+/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys export \
+  --type sqlite --force-overwrite=true \
+  -o profiler_outputs/nsys_overlap_attnpredict_r16_s16_bs2_128k_o64.sqlite \
+  profiler_outputs/nsys_overlap_attnpredict_r16_s16_bs2_128k_o64.nsys-rep
+```
+
+trace 下的吞吐：
+
+| 指标 | 数值 |
+| --- | ---: |
+| TTFT | 51.59s |
+| PreTP | 4961.9 tok/s |
+| DecTP | 45.70 tok/s |
+| ITL | 43.77ms |
+
+> `nsys` 会扰动吞吐，本节只使用 timeline 相对时间和 stream 重合关系，不把该 DecTP 当作最终性能结果。
+
+项目 profiler 摘要：
+
+| 区间 | 调用次数 | 总耗时 |
+| --- | ---: | ---: |
+| `model_run_model_decode` | 63 | 2.634s |
+| `attnpredict_offload_predict_cnn_stream` | 24 | 0.358s |
+| `attnpredict_offload_h2d_prefetch_stream` | 68 | 0.0357s |
+| `attnpredict_offload_prefetch_wait` | 32 | 0.0021s |
+
+### Predictor cluster 与主计算 step 的重合
+
+`predictor cluster` 指一次刷新周期里 8 个 source layer 组依次执行的 predictor 区间。  
+相对时间以第一个 `model_run_model_decode` 开始为 `0ms`。
+
+| cluster | predictor 区间 | 所在 decode step | 主计算区间 | 重合时间 | predictor 是否赶在该 step 结束前完成 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 593.248-768.915ms | step 16 | 587.754-770.619ms | 175.667ms | 提前 1.704ms |
+| 2 | 1344.283-1461.762ms | step 32 | 1342.823-1464.700ms | 117.479ms | 提前 2.938ms |
+| 3 | 2039.102-2159.524ms | step 48 | 2035.312-2160.754ms | 120.423ms | 提前 1.229ms |
+
+结论：在本次 trace 中，三次 predictor cluster 都在对应的主计算 step 结束前完成。因此下一次同层真正消费新 lease 时，预测结果已经准备好，这也解释了为什么 `prefetch_wait` 总量只有 `2.1ms`。
+
+### 有预测开销 vs 普通复用步
+
+按 decode step 分类：
+
+| step 类型 | 数量 | `model_run_model_decode` 平均 wall time | 最小值 | 最大值 |
+| --- | ---: | ---: | ---: | ---: |
+| 普通复用步，无 predictor overlap | 56 | 34.497ms | 33.940ms | 38.449ms |
+| predictor overlap 步 | 3 | 143.394ms | 121.877ms | 182.865ms |
+| 切换新 lease 后清理步 | 3 | 63.622ms | 60.377ms | 67.963ms |
+| 第一个 decode step | 1 | 80.672ms | 80.672ms | 80.672ms |
+
+局部时间线例子：
+
+| step | 主计算区间 | predictor cluster | 主计算耗时 |
+| ---: | ---: | ---: | ---: |
+| 15 | 551.656-585.657ms | 无 | 34.001ms |
+| 16 | 587.754-770.619ms | cluster 1 | 182.865ms |
+| 17 | 772.157-840.120ms | 无，切换后清理 | 67.963ms |
+| 18 | 841.664-875.854ms | 无 | 34.190ms |
+
+结论：后续普通复用步没有 predictor 开销时，主计算 wall time 会回到约 `34ms`；预测步明显变长。
+
+### CUDA stream 归属
+
+从 CUPTI kernel 统计看：
+
+- 主模型 decode kernel 主要在 `streamId=7`。
+- predictor/prefetch 主要在 `streamId=29`。
+
+区间内 stream kernel 总量：
+
+| 区间 | stream | kernel 总时间 |
+| --- | ---: | ---: |
+| `model_run_model_decode` | 7 | 712.695ms |
+| `model_run_model_decode` | 29 | 194.826ms |
+| `attnpredict_offload_predict_cnn_stream` | 29 | 194.640ms |
+| `attnpredict_offload_predict_cnn_stream` | 7 | 34.702ms |
+| `attnpredict_offload_h2d_prefetch_stream` | 29 | 12.406ms |
+| `attnpredict_offload_h2d_prefetch_stream` | 7 | 3.798ms |
+
+进一步按 kernel 时间重叠计算，predictor stream 29 的 kernel 与主流 stream 7 的 kernel 同时执行比例不高：
+
+| cluster | stream 29 predictor kernel 时间 | 与 stream 7 主计算 kernel 重叠时间 | 重叠比例 |
+| ---: | ---: | ---: | ---: |
+| 1 | 65.232ms | 4.301ms | 6.6% |
+| 2 | 64.849ms | 4.459ms | 6.9% |
+| 3 | 64.737ms | 5.534ms | 8.5% |
+
+这说明：从 NVTX wall time 看，predictor 区间几乎完全落在主计算 step 内；但从真实 kernel 并发看，两个 stream 并不是大量同时跑 kernel，而更像 predictor stream 插入/穿插到主计算时间段里，拉长了该 decode step 的 wall time。
+
+### 本轮结论
+
+1. predictor 能在下一次同层消费前完成。三次 predictor cluster 都在所在 decode step 结束前约 `1-3ms` 完成，`prefetch_wait` 总量也只有 `2.1ms`。
+2. 后续没有 predictor 的普通复用步确实明显更快，平均 `34.5ms`；有 predictor overlap 的步平均 `143.4ms`。
+3. predictor 不是主要造成“等待下一步新 lease”的阻塞，而是在预测步本身拉长主计算 wall time。
+4. 真实 kernel 并发比例只有约 `6-9%`，所以问题不只是“两个流同时跑满 GPU”，还包括 stream 调度、kernel 插队、CPU/PyTorch 调度、以及主流时间段被 predictor 任务穿插拉长。
+5. 下一步优化应继续减少 predictor 刷新步本身的 GPU kernel 数量和 runtime 固定成本，而不是继续放宽 `max_stale_steps`。
+
+## 2026-06-07 no-overlap 对照实验：把 predictor 放到 step 末尾
+
+### 实验目的
+
+根据小导建议，验证“主计算流和 predictor 异步流如果不重合，而是按先后顺序执行”，预测刷新步是否会变短。
+
+本实验是诊断实验，不作为最终实现采纳：
+
+- overlap：当前稳定实现，source layer attention 结束后立即把 predictor 提交到后台 stream。
+- no-overlap：临时把 decode predictor 延迟到 `post_forward()`，即本 step 主模型 decode 全部结束后，再统一提交 predictor 并等待完成。
+
+`no-overlap`（不重合，即 predictor 不插入当前主计算 step，而是在主计算结束后执行）用于判断 predictor 是否拖慢主计算流。
+
+### 实验命令
+
+```bash
+NSYS=/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys
+
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+PROFILER_SVLLM=1 CUDA_SYNC_SVLLM=0 \
+$NSYS profile \
+  --trace=cuda,nvtx,osrt \
+  --cuda-memory-usage=true \
+  --sample=none \
+  --force-overwrite=true \
+  -o profiler_outputs/nsys_nooverlap_step_boundary_r16_s16_bs2_128k_o64_v2 \
+  .venv/bin/python scripts/bench_sparse_vllm.py \
+  --model_path /root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+  --methods attnpredict-offload \
+  --lengths 128000 \
+  --batch_sizes 2 \
+  --output_len 64 \
+  --hyper_params '{"gpu_memory_utilization":0.7,"chunk_prefill_size":4096,"tensor_parallel_size":1,"attnpredict_model_path":"/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth","attnpredict_history_steps":64,"attnpredict_pooling_block_size":16,"attnpredict_reuse_steps":16,"attnpredict_max_stale_steps":16,"attnpredict_offload_cpu_threads":8,"attnpredict_offload_cpu_slots":-1,"attnpredict_offload_cpu_memory_utilization":0.7,"attnpredict_offload_pin_staging":true,"num_top_tokens":4096,"num_sink_tokens":64,"num_recent_tokens":512,"enable_profiler":true}'
+```
+
+### 吞吐结果
+
+Nsight trace 会扰动吞吐，因此只比较同为 Nsight trace 下的相对结果。
+
+| 模式 | TTFT | DecTP | `model_run_model_decode` 总耗时 | `predict_cnn_stream` 总耗时 | `prefetch_wait` 总耗时 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| overlap 当前实现 | 51.59s | 45.70 tok/s | 2.634s | 0.358s | 0.002s |
+| no-overlap step 末尾预测 | 65.17s | 43.81 tok/s | 2.358s | 2.354s | 0.323s |
+
+结论：no-overlap 后，主模型 decode 本身变短（`2.634s -> 2.358s`），说明 predictor 的确会拉长主计算流；但 predictor 被挪到 step 末尾后需要显式等待，总 decode 吞吐反而下降（`45.70 -> 43.81 tok/s`）。
+
+### 预测刷新步拆分
+
+`predictor envelope` 是一次刷新周期内 8 个 source-layer 组的 predictor 从开始到结束的总墙钟区间，不等于纯 GPU kernel 时间。
+
+| 模式 | step | 主计算区间 | 主计算耗时 | predictor 区间 | predictor 耗时 | 主计算与 predictor 关系 | step 总观察时间 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| overlap | 16 | 587.754-770.619ms | 182.865ms | 593.248-768.915ms | 175.667ms | predictor 插在主计算内 | 182.865ms |
+| no-overlap | 16 | 620.994-662.431ms | 41.437ms | 664.970-836.196ms | 171.227ms | 主计算结束后再预测 | 215.202ms |
+| overlap | 32 | 1342.823-1464.700ms | 121.877ms | 1344.283-1461.762ms | 117.479ms | predictor 插在主计算内 | 121.877ms |
+| no-overlap | 32 | 1420.045-1457.081ms | 37.037ms | 1458.699-1549.611ms | 90.912ms | 主计算结束后再预测 | 129.567ms |
+| overlap | 48 | 2035.312-2160.754ms | 125.441ms | 2039.102-2159.524ms | 120.423ms | predictor 插在主计算内 | 125.441ms |
+| no-overlap | 48 | 2131.161-2170.047ms | 38.886ms | 2171.834-2262.202ms | 90.367ms | 主计算结束后再预测 | 131.041ms |
+
+### 解释
+
+1. no-overlap 证明了 predictor 会影响主计算：没有 predictor 插入时，刷新 step 的 `model_run_model_decode` 从 `121-183ms` 降到约 `37-41ms`。
+2. no-overlap 没有提升总吞吐：predictor 被移动到主计算后面，主流必须等它完成，导致 `model_sparse_post` 和 `prefetch_wait` 明显变大。
+3. 当前 overlap 策略虽然拉长刷新 step，但仍能隐藏一部分 predictor 墙钟时间，因此总体比 no-overlap 更快。
+4. 更合理的优化方向不是简单取消 overlap，而是降低 predictor 自身的 runtime 固定成本，或让 predictor 使用更少、更短的 GPU kernel，减少它对主计算流的插入影响。
+
+### 是否采纳
+
+不采纳 no-overlap 作为最终路径。该实验只作为诊断证据保留。
+
+原因：
+
+- 证明 predictor 资源竞争真实存在。
+- 但把 predictor 放到 step 末尾会降低 DecTP。
+- 说明后续要做的是“减轻 predictor 干扰”，不是“完全串行化 predictor”。
+
+## 2026-06-07 当前代码跨层复用消融：`layer_reuse_stride=1`
+
+用户希望用当前代码直接对比“开启跨层复用”和“不启用跨层复用”，替换之前旧提交隔离实验在 PPT 中的位置。
+
+实验方式：
+
+- 临时把 `src/sparsevllm/engine/cache_manager/attnpredict_offload.py` 中 `_layer_reuse_stride` 从 `4` 改为 `1`。
+- `layer_reuse_stride=1` 表示每一层都是 source layer，即不做跨层复用。
+- 其它配置保持当前最终性能配置：`reuse_steps=16`、`max_stale_steps=16`、`top-k=4096`、`sink=64`、`recent=512`。
+- 实验结束后已恢复 `_layer_reuse_stride=4`。
+
+语法检查：
+
+```bash
+.venv/bin/python -m py_compile src/sparsevllm/engine/cache_manager/attnpredict_offload.py
+```
+
+目标命令：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+ATTNPREDICT_MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth \
+LENGTHS=128000 BATCH_SIZES=2 OUTPUT_LEN=64 GPU_MEMORY_UTILIZATION=0.7 \
+ATTNPREDICT_REUSE_STEPS=16 ATTNPREDICT_MAX_STALE_STEPS=16 \
+SPARSEVLLM_MASTER_PORT=2388 \
+bash scripts/bench_attnpredict_vs_vanilla_128k.sh \
+  2>&1 | tee run_stride1_ablation_r16_s16_bs2_128k_20260607.log
+```
+
+日志确认：
+
+```text
+layer_reuse_stride=1
+```
+
+结果：
+
+| method | TTFT | PreTP | DecTP | ITL | Mem | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vanilla | 42.65s | 6002.6 tok/s | 46.62 tok/s | 42.90ms | 66.49GB | 1.00x |
+| attnpredict-offload `stride=1` | 51.46s | 4974.6 tok/s | 37.03 tok/s | 54.01ms | 52.26GB | 0.79x |
+
+对比当前同机 `stride=4` 稳定结果：
+
+| 配置 | DecTP |
+| --- | ---: |
+| `stride=1 + reuse/max_stale=16/16` | 37.03 tok/s |
+| `stride=4 + reuse/max_stale=16/16` | 约 52.33 tok/s |
+
+结论：
+
+- 当前代码下，不启用跨层复用时，attnpredict-offload 只有 `37.03 tok/s`，低于 vanilla。
+- 开启 `layer_reuse_stride=4` 后可到约 `52.33 tok/s`，超过 vanilla。
+- 因此跨层复用是当前最终性能配置的关键组成；相比旧提交隔离实验，这个当前代码消融更适合放在 PPT 中说明跨层复用收益。
+
+### 补充：同时关闭跨步复用和跨层复用
+
+用户进一步要求测试“不开层复用、不开步复用”的结果。实验方式：
+
+- 临时把 `_layer_reuse_stride` 从 `4` 改为 `1`。
+- 运行参数设为 `ATTNPREDICT_REUSE_STEPS=1`、`ATTNPREDICT_MAX_STALE_STEPS=1`。
+- 该配置表示每层、每个 decode step 都刷新 predictor。
+- 实验结束后已恢复 `_layer_reuse_stride=4`。
+
+目标命令：
+
+```bash
+PATH=/root/autodl-tmp/Sparse-vLLM/.venv/bin:$PATH \
+MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/models/llama-3.1-8B-Instruct \
+ATTNPREDICT_MODEL_PATH=/root/autodl-tmp/Sparse-vLLM/predictor/CNN_llama3.1_alltask_5case/best_model.pth \
+LENGTHS=128000 BATCH_SIZES=2 OUTPUT_LEN=64 GPU_MEMORY_UTILIZATION=0.7 \
+ATTNPREDICT_REUSE_STEPS=1 ATTNPREDICT_MAX_STALE_STEPS=1 \
+SPARSEVLLM_MASTER_PORT=2389 \
+bash scripts/bench_attnpredict_vs_vanilla_128k.sh \
+  2>&1 | tee run_stride1_reuse1_ablation_bs2_128k_20260607.log
+```
+
+日志确认：
+
+```text
+reuse_steps=1 max_stale_steps=1 layer_reuse_stride=1
+```
+
+结果：
+
+| method | TTFT | PreTP | DecTP | ITL | Mem | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vanilla | 42.93s | 5963.0 tok/s | 46.73 tok/s | 42.80ms | 66.49GB | 1.00x |
+| attnpredict-offload `stride=1, reuse=1` | 52.28s | 4896.7 tok/s | 10.32 tok/s | 193.72ms | 52.26GB | 0.22x |
+
+对比当前代码消融：
+
+| 配置 | DecTP |
+| --- | ---: |
+| 不做跨步/跨层复用：`stride=1 + reuse/max_stale=1/1` | 10.32 tok/s |
+| 只做跨步复用：`stride=1 + reuse/max_stale=16/16` | 37.03 tok/s |
+| 跨步 + 跨层复用：`stride=4 + reuse/max_stale=16/16` | 约 52.33 tok/s |
+
+结论：不开跨步复用和不开跨层复用时，每层每步都要执行 predictor 刷新，DecTP 只有 `10.32 tok/s`。这进一步说明当前最终性能主要来自减少 predictor 刷新频率：先通过跨步复用减少时间维度刷新次数，再通过跨层复用减少层维度刷新次数。
