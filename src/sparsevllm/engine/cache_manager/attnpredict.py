@@ -7,7 +7,12 @@ from sparsevllm.config import Config
 from sparsevllm.utils.profiler import profiler
 
 from .standard import StandardCacheManager
-from .attnpredict_cnn import AttnPredictCNN
+from .attnpredict_offload import AttnPredictCNN
+from .predictive_offload import (
+    hot_block_budget,
+    prediction_block_window,
+    select_hot_block_indices,
+)
 
 
 class AttnPredictCacheManager(StandardCacheManager):
@@ -23,13 +28,7 @@ class AttnPredictCacheManager(StandardCacheManager):
         self._init_attnpredictor_state(config)
 
     def _init_attnpredictor_state(self, config: Config) -> None:
-        """初始化 AttentionPredictor 共享状态。
-
-        这里只包含 predictor 算法本身需要的状态：稀疏预算、滚动 attention
-        历史、每层预测 mask，以及 CNN checkpoint。它不初始化任何物理 KV
-        slot 结构，因此普通 attnpredict 和 attnpredict-offload 都可以复用。
-        """
-        # ---- AttentionPredictor 超参 ----
+        """初始化 CNN 所需的历史、预测 mask 和模型。"""
         self.topk = int(config.num_top_tokens)
         self.history_step = int(config.attnpredict_history_steps)
         self.pooling_block_size = int(config.attnpredict_pooling_block_size)
@@ -56,12 +55,12 @@ class AttnPredictCacheManager(StandardCacheManager):
 
         # ---- 加载 CNN 预测器 ----
         self.cnn = AttnPredictCNN()
-        model_path = str(config.attnpredict_model_path or "")
+        model_path = str(config.attnpredict_model_path)
         state_dict = torch.load(model_path, map_location="cuda", weights_only=False)
-        self.cnn.load_state_dict(state_dict) # cnn模型占gpu的2MB显存，很小
+        self.cnn.load_state_dict(state_dict)
         self.cnn.to(dtype=torch.float16, device="cuda", memory_format=torch.channels_last)
+        self.cnn_dtype = torch.float16
         self.cnn.eval()
-        self.cnn_dtype = next(self.cnn.parameters()).dtype
 
     def free_seq(self, seq_id: int):
         """释放序列时同步清理该 cache row 的 attention 历史与预测 mask。"""
@@ -277,6 +276,9 @@ class AttnPredictCacheManager(StandardCacheManager):
                 if positions is None:
                     # 上一步未使用稀疏 view，attention 已经是完整序列
                     full_attn = attn[:, :full_len]
+                    observed_token_mask = torch.ones(
+                        full_len, dtype=torch.bool, device=attn.device
+                    )
                 else:
                     # 稀疏 view 上的 attention 按逻辑位置 scatter 回完整 token 空间
                     pos = positions[b, :view_len].to(device=attn.device, dtype=torch.long)
@@ -286,11 +288,17 @@ class AttnPredictCacheManager(StandardCacheManager):
                         device=attn.device,
                     )
                     full_attn.scatter_(1, pos.unsqueeze(0).expand(attn.shape[0], -1), attn)
+                    observed_token_mask = torch.zeros(
+                        full_len, dtype=torch.bool, device=attn.device
+                    )
+                    observed_token_mask[pos] = True
 
                 self._update_row_prediction(
                     layer_idx,
                     row_idx,
                     full_attn.unsqueeze(1).to(self.hf_config.torch_dtype),
+                    observed_token_mask=observed_token_mask,
+                    step_position=full_len,
                 )
 
     # ================================================================
@@ -302,47 +310,27 @@ class AttnPredictCacheManager(StandardCacheManager):
         layer_idx: int,
         row_idx: int,
         attn_weights_full: torch.Tensor,
+        *,
+        observed_token_mask: torch.Tensor | None = None,
+        step_position: int | None = None,
     ) -> None:
         """更新指定 cache row 的 attention 历史，并预测新的 keep mask。
 
         完整流程：max-pooling → 滚动更新历史 → CNN 预测 block 重要性 → 生成 token mask
         """
-        hist = self._update_attn_history(
-            self.attn_history[layer_idx].get(row_idx),
-            attn_weights_full,
+        attn_pooling = self._max_pooling(attn_weights_full)
+        tsp_attn, start_block = self._update_predictor_scores_from_pooled(
+            layer_idx,
+            row_idx,
+            attn_pooling,
+            step_position=int(step_position or attn_weights_full.shape[-1]),
         )
-        self.attn_history[layer_idx][row_idx] = hist
-
-        # CNN 预测 block 级重要性得分
-        tsp_attn, start_block = self._time_sequence_predict(hist)
         seq_len = int(attn_weights_full.shape[-1])
         self.tsp_mask[layer_idx][row_idx] = self._create_tsp_mask(
             tsp_attn,
             seq_len=seq_len,
             start_block=start_block,
             device=attn_weights_full.device,
-        )
-
-    def _update_row_prediction_from_pooled(
-        self,
-        layer_idx: int,
-        row_idx: int,
-        attn_pooling: torch.Tensor,
-        *,
-        seq_len: int,
-    ) -> None:
-        """用已经池化到 block 级的 attention 历史更新 predictor mask。"""
-        hist = self._update_pooled_attn_history(
-            self.attn_history[layer_idx].get(row_idx),
-            attn_pooling,
-        )
-        self.attn_history[layer_idx][row_idx] = hist
-        tsp_attn, start_block = self._time_sequence_predict(hist)
-        self.tsp_mask[layer_idx][row_idx] = self._create_tsp_mask(
-            tsp_attn,
-            seq_len=int(seq_len),
-            start_block=start_block,
-            device=attn_pooling.device,
         )
 
     def _max_pooling(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -396,6 +384,33 @@ class AttnPredictCacheManager(StandardCacheManager):
         hist = torch.cat([attn_history, attn_pooling], dim=-2)
         return hist[:, -self.history_step:, :]
 
+    def _update_predictor_scores_from_pooled(
+        self,
+        layer_idx: int,
+        row_idx: int,
+        attn_pooling: torch.Tensor,
+        *,
+        observed_block_mask: torch.Tensor | None = None,
+        step_position: int | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """更新 CNN 历史并返回 block 重要性分数。"""
+        del observed_block_mask, step_position
+        hist = self._update_pooled_attn_history(
+            self.attn_history[layer_idx].get(row_idx),
+            attn_pooling,
+        )
+        self.attn_history[layer_idx][row_idx] = hist
+        return self._time_sequence_predict(hist)
+
+    def _prediction_block_window(self, attn_len: int) -> tuple[int, int]:
+        """返回排除 sink/local 后需要预测的 block 范围。"""
+        return prediction_block_window(
+            attn_len,
+            sink_tokens=self.sink_token,
+            recent_tokens=self.local_token,
+            block_size=self.pooling_block_size,
+        )
+
     def _time_sequence_predict(self, attn_history: torch.Tensor) -> tuple[torch.Tensor, int]:
         """CNN 前向预测：只对 sink 和 local 之外的「中间」block 做预测。
 
@@ -405,9 +420,7 @@ class AttnPredictCacheManager(StandardCacheManager):
         """
         num_heads, num_rows, attn_len = attn_history.shape
         # sink 和 local token 是强制保留的，不需要 CNN 预测
-        start = self.sink_token // self.pooling_block_size
-        end = attn_len - (self.local_token // self.pooling_block_size)
-        end = max(start, end)
+        start, end = self._prediction_block_window(int(attn_len))
         attn_history = attn_history[:, :, start:end]
         pred_len = int(attn_history.shape[-1])
 
@@ -460,15 +473,18 @@ class AttnPredictCacheManager(StandardCacheManager):
 
         # 与原始 AttentionPredictor 语义对齐：topk 是总保留预算，
         # CNN 额外选择的中间区域预算需要排除 sink/local。
-        middle_budget = self.topk - self.sink_token - self.local_token
-        block_budget = middle_budget // self.pooling_block_size
-        block_budget = max(0, min(block_budget, pred_len))
+        block_budget = hot_block_budget(
+            topk_tokens=self.topk,
+            sink_tokens=self.sink_token,
+            recent_tokens=self.local_token,
+            block_size=self.pooling_block_size,
+            candidate_blocks=pred_len,
+        )
         if block_budget <= 0:
             return keep_mask
 
         # per-head 得分 → head 维 max → shared block 得分
-        block_scores = tsp_attn.max(dim=0).values if tsp_attn.dim() == 2 else tsp_attn #TODO 目前版本是取头维 max-pooling, 后续可以考虑其他聚合方式或保留 per-head 预测结果
-        _, topk_indices = torch.topk(block_scores, block_budget, dim=-1)
+        topk_indices = select_hot_block_indices(tsp_attn, block_budget)
 
         # block 索引展开为 token 索引
         token_indices = (

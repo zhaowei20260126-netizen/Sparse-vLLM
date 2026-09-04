@@ -16,7 +16,7 @@ class Config:
     max_model_len: int = 128_000 # 单个序列的最大长度，超过这个长度的部分可能会被截断或者导致错误。
     max_decoding_seqs: int = 64 # 限制 decode 队列的长度,正同时进行 decode 的序列最多 64 个
 
-    chunk_prefill_size: int = 8192
+    chunk_prefill_size: int = 4096
     gpu_memory_utilization: float = 0.8
     tensor_parallel_size: int = 1
     enforce_eager: bool = True
@@ -25,7 +25,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "deltakv-standalone", "deltakv-snapkv", "pyramidkv", "dsa", "attnpredict", "attnpredict-offload"
+    vllm_sparse_method: str = ""  # 稀疏方法名；空字符串表示完整注意力。
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -47,13 +47,28 @@ class Config:
     attnpredict_history_steps: int = 64
     attnpredict_pooling_block_size: int = 16
     attnpredict_model_path: str = ""
+    siema_alpha: float = 0.1
+    siema_scale_invariant: bool = True
+    # 前 N 层在 decode 阶段保留完整 KV 并执行完整注意力；设为 0 可做消融。
+    attnpredict_num_full_layers: int = 2
     attnpredict_reuse_steps: int = 16
     attnpredict_max_stale_steps: int = 16
     attnpredict_layer_reuse_stride: int = 4  # 每隔多少层重新跑一次 predictor，组内其余层复用首层结果
     attnpredict_offload_cpu_threads: int = 8
     attnpredict_offload_cpu_slots: int = -1
     attnpredict_offload_cpu_memory_utilization: float = 0.70
-    attnpredict_offload_pin_staging: bool = True
+    # D2H/H2D 固定使用异步 pinned ring。
+    attnpredict_offload_staging_slots: int = 3
+    attnpredict_offload_staging_chunk_tokens: int = 4096
+    # GPU 驻留策略；eager 为默认基线，lease-aware 保留上一代 Lease。
+    attnpredict_offload_residency_policy: str = "eager"
+    # lease-aware 的危险水位；-1 表示自动计算。
+    attnpredict_offload_free_critical_watermark_tokens: int = -1
+
+    # Dense Oracle 轨迹采集，仅用于离线比较预测器，不改变注意力可见集合。
+    attnpredict_oracle_trace_dir: str = ""
+    attnpredict_oracle_layer_stride: int = 4
+    attnpredict_oracle_max_steps: int = 128
 
     # SnapKV Config
     snapkv_window_size: int = 32
@@ -129,6 +144,8 @@ class Config:
             self.vllm_sparse_method = "streamingllm"
         elif self.vllm_sparse_method in ("attentionpredictor-offload", "attenpredictor-offload"):
             self.vllm_sparse_method = "attnpredict-offload"
+        elif self.vllm_sparse_method == "si-ema":
+            self.vllm_sparse_method = "siema"
         
         if self.num_top_tokens_in_prefill is None:
             self.num_top_tokens_in_prefill = self.num_top_tokens
@@ -182,24 +199,50 @@ class Config:
             raise ValueError("quest_token_budget 必须 > 0")
         if self.quest_skip_layers < 0:
             raise ValueError("quest_skip_layers 不能 < 0")
-        if self.vllm_sparse_method in ("attnpredict", "attnpredict-offload"):
-            if not self.attnpredict_model_path:
-                raise ValueError(f"vllm_sparse_method={self.vllm_sparse_method!r} 需要设置 attnpredict_model_path")
-            if not os.path.isfile(self.attnpredict_model_path):
-                raise FileNotFoundError(f"attnpredict_model_path 不存在: {self.attnpredict_model_path}")
+        if self.vllm_sparse_method in (
+            "attnpredict",
+            "attnpredict-offload",
+            "siema",
+        ):
+            if self.vllm_sparse_method in ("attnpredict", "attnpredict-offload"):
+                if not self.attnpredict_model_path:
+                    raise ValueError(f"vllm_sparse_method={self.vllm_sparse_method!r} 需要设置 attnpredict_model_path")
+                if not os.path.isfile(self.attnpredict_model_path):
+                    raise FileNotFoundError(f"attnpredict_model_path 不存在: {self.attnpredict_model_path}")
+            else:
+                try:
+                    self.siema_alpha = float(self.siema_alpha)
+                except (TypeError, ValueError) as e:
+                    raise ValueError("siema_alpha 必须是 (0, 1] 范围内的数字") from e
+                if not 0 < self.siema_alpha <= 1:
+                    raise ValueError("siema_alpha 必须在 (0, 1] 范围内")
+                if not isinstance(self.siema_scale_invariant, bool):
+                    raise ValueError("siema_scale_invariant 必须是布尔值")
             if int(self.num_top_tokens) <= 0:
                 raise ValueError("attnpredict 使用的 num_top_tokens 必须 > 0")
             if self.num_sink_tokens < 0 or self.num_recent_tokens < 0:
                 raise ValueError("attnpredict 使用的 num_sink_tokens/num_recent_tokens 不能 < 0")
             if self.attnpredict_history_steps <= 0:
                 raise ValueError("attnpredict_history_steps 必须 > 0")
+            if not 0 <= int(self.attnpredict_num_full_layers) <= int(
+                self.hf_config.num_hidden_layers
+            ):
+                raise ValueError(
+                    "attnpredict_num_full_layers 必须在 [0, 模型层数] 范围内"
+                )
+            self.attnpredict_num_full_layers = int(
+                self.attnpredict_num_full_layers
+            )
             if self.attnpredict_pooling_block_size <= 0:
                 raise ValueError("attnpredict_pooling_block_size 必须 > 0")
             if self.attnpredict_reuse_steps <= 0:
                 raise ValueError("attnpredict_reuse_steps 必须 > 0")
             if self.attnpredict_max_stale_steps < self.attnpredict_reuse_steps:
                 raise ValueError("attnpredict_max_stale_steps 必须 >= attnpredict_reuse_steps")
-            if self.vllm_sparse_method == "attnpredict-offload":
+            if self.vllm_sparse_method in (
+                "attnpredict-offload",
+                "siema",
+            ):
                 if self.attnpredict_layer_reuse_stride < 1:
                     raise ValueError("attnpredict_layer_reuse_stride 必须 >= 1")
                 if self.attnpredict_offload_cpu_threads < 1:
@@ -213,6 +256,32 @@ class Config:
                 if not (0 < cpu_mem_util <= 1):
                     raise ValueError("attnpredict_offload_cpu_memory_utilization 必须在 (0, 1] 范围内")
                 self.attnpredict_offload_cpu_memory_utilization = cpu_mem_util
+                if int(self.attnpredict_offload_staging_slots) < 2:
+                    raise ValueError("attnpredict_offload_staging_slots 必须 >= 2")
+                if int(self.attnpredict_offload_staging_chunk_tokens) < 1:
+                    raise ValueError("attnpredict_offload_staging_chunk_tokens 必须 >= 1")
+                residency_policy = str(
+                    self.attnpredict_offload_residency_policy
+                ).strip().lower()
+                if residency_policy not in ("eager", "lease-aware"):
+                    raise ValueError(
+                        "attnpredict_offload_residency_policy 必须是 "
+                        "'eager' 或 'lease-aware'"
+                    )
+                self.attnpredict_offload_residency_policy = residency_policy
+                if int(self.attnpredict_offload_free_critical_watermark_tokens) < -1:
+                    raise ValueError(
+                        "attnpredict_offload_free_critical_watermark_tokens "
+                        "必须为 -1 或非负整数"
+                    )
+
+        if self.vllm_sparse_method == "oracle-trace":
+            if not str(self.attnpredict_oracle_trace_dir).strip():
+                raise ValueError("oracle-trace 需要设置 attnpredict_oracle_trace_dir")
+            if int(self.attnpredict_oracle_layer_stride) < 1:
+                raise ValueError("attnpredict_oracle_layer_stride 必须 >= 1")
+            if int(self.attnpredict_oracle_max_steps) < 1:
+                raise ValueError("attnpredict_oracle_max_steps 必须 >= 1")
 
         # Normalize compressor type strings.
         for attr in ("compressor_down_type", "compressor_up_type"):

@@ -216,6 +216,14 @@ class LLMEngine:
         # 预热 1 个 Token 的生成（包含 Prefill 和 Decode）
         sampling_params = SamplingParams(max_tokens=1)
         max_prompt_len = max(1, int(self.config.max_model_len) - int(sampling_params.max_tokens))
+        # A deliberately capped offload active pool may be smaller than
+        # max_model_len even though CPU backing can hold the full request.
+        # Warmup itself still uses full-attention prefill, so it must fit the
+        # currently admissible GPU prompt slots.
+        max_prompt_len = min(
+            max_prompt_len,
+            max(1, int(self.model_runner.cache_manager.prompt_admission_free_slots())),
+        )
         if warmup_len > max_prompt_len:
             logger.warning(
                 f"Warmup prompt length ({warmup_len}) exceeds max_model_len - max_tokens "
@@ -330,7 +338,7 @@ class LLMEngine:
                 finished_outputs = []
                 for seq in seqs:
                     if seq.is_finished:
-                        self.model_runner.call("free_slots", seq.seq_id)
+                        self.model_runner.call("free_slots", seq.seq_id, True)
                         finished_outputs.append((seq.seq_id, seq.completion_token_ids))
         
         # --- 6. 记账与性能上报 (Throughput Logging) ---
@@ -411,8 +419,14 @@ class LLMEngine:
                     pbar.update(1)
                     
         # 按照请求提交顺序排序并解码
-        results = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        results = [{"text": self.tokenizer.decode(tids, skip_special_tokens=True), "token_ids": tids} for tids in results]
+        results = [
+            {
+                "seq_id": seq_id,
+                "text": self.tokenizer.decode(outputs[seq_id], skip_special_tokens=True),
+                "token_ids": outputs[seq_id],
+            }
+            for seq_id in sorted(outputs.keys())
+        ]
         
         if use_tqdm:
             pbar.close()

@@ -207,6 +207,7 @@ class Attention(nn.Module):
                 max_input_len = b_seq_len.max().item()
  
                 prefill_attn_score_block_size = None
+                prefill_attn_score_use_block_logits = False
                 prefill_attn_score = cache_manager.prepare_prefill_predictor_inputs(
                     context.now_layer_idx,
                     q,
@@ -221,8 +222,12 @@ class Attention(nn.Module):
                 )
                 if prefill_attn_score is not None:
                     layer_attn_score = prefill_attn_score
-                    prefill_attn_score_block_size = cache_manager.prefill_attn_score_block_size( 
-                        context.now_layer_idx
+                    if prefill_attn_score_block_size is None:
+                        prefill_attn_score_block_size = cache_manager.prefill_attn_score_block_size(
+                            context.now_layer_idx
+                        )
+                    prefill_attn_score_use_block_logits = (
+                        cache_manager.prefill_attn_score_use_block_logits(context.now_layer_idx)
                     )
 
                 # Triton 路径需要物理槽位 layer_active_slots 用于 Req_to_tokens 寻址
@@ -234,6 +239,7 @@ class Attention(nn.Module):
                     layer_active_slots,      # ★ 决定实际读哪些物理 slot
                     attn_score=layer_attn_score,  # ★ 收集注意力分数到 attn_score 张量
                     attn_score_block_size=prefill_attn_score_block_size,
+                    attn_score_use_block_logits=prefill_attn_score_use_block_logits,
                 ) 
             else:    # decode ,
                 # cache manager 决定本层看哪些 KV

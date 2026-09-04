@@ -158,6 +158,14 @@ class CacheManager(ABC):
             from .attnpredict_offload import AttnPredictOffloadCacheManager
 
             return AttnPredictOffloadCacheManager(config, rank, world_size)
+        if sparse_method == "siema":
+            from .siema import SIEMACacheManager
+
+            return SIEMACacheManager(config, rank, world_size)
+        if sparse_method == "oracle-trace":
+            from .oracle_trace import OracleTraceCacheManager
+
+            return OracleTraceCacheManager(config, rank, world_size)
         if sparse_method == "quest":
             from .quest import QuestCacheManager
 
@@ -416,6 +424,10 @@ class CacheManager(ABC):
     def prefill_attn_score_block_size(self, layer_idx: int) -> int | None:
         """返回 prefill 4D attn_score 的 block 粒度；默认 token 级或不使用。"""
         return None
+
+    def prefill_attn_score_use_block_logits(self, layer_idx: int) -> bool:
+        """4D prefill score 是否记录可归一化的 block-max logits。"""
+        return False
 
     def should_collect_decode_attn_score(self, layer_idx: int) -> bool:
         """decode 是否需要收集 attention score；默认保持每步收集。"""

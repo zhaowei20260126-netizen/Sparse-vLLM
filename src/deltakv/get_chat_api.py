@@ -228,9 +228,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             elif temperature < 1e-5:
                 temperature = 1e-5
             
-            sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+            sampling_params = SamplingParams(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                ignore_eos=bool(kwargs.get("ignore_eos", False)),
+            )
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
-            
+            if kwargs.get("return_generation_metadata", False):
+                return outputs[0] if is_single else outputs
             results = [out['text'] for out in outputs]
             if return_kv_cache:
                 return (results[0], None) if is_single else (results, None)
@@ -256,6 +261,8 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         return runtime_infer_config, model_load_kwargs, target_torch_dtype
 
     assert use_cache, '还要做padding才能用训练代码推理'
+    force_hf_generate = False
+    require_single_prompt = False
     if model_cls == 'deltakv':
         runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
@@ -504,6 +511,24 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
     elif model_cls == 'omnikv':
         print('💡💡💡 OmniKV')
         model = load_omnikv_model(model_path, infer_config, cuda_device)
+
+    elif model_cls == 'attentionpredictor':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from baselines.attentionpredictor import load_attentionpredictor_model
+
+        model = load_attentionpredictor_model(
+            model_path=model_path,
+            runtime_infer_config=runtime_infer_config,
+            compressor_path=compressor_path,
+            cuda_device=cuda_device,
+            torch_dtype=target_torch_dtype,
+            model_load_kwargs=model_load_kwargs,
+        )
+        force_hf_generate = True
+        require_single_prompt = True
 
     elif model_cls == 'auto':
         runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
@@ -1057,7 +1082,9 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
     tokenizer.padding_side = 'left'
 
     def generate(prompt: Union[str, List[str]], past_key_values=None, **kwargs):
-        if os.getenv('ENABLE_HF_GEN'):
+        if require_single_prompt and not isinstance(prompt, str) and len(prompt) != 1:
+            raise ValueError("AttentionPredictor HF baseline 第一版只支持 batch_size=1")
+        if force_hf_generate or os.getenv('ENABLE_HF_GEN'):
             return hf_gen(model, tokenizer, prompt, return_kv_cache, past_key_values, **kwargs)
         else:
             return manual_generate(model, tokenizer, prompt, past_key_values, return_kv_cache, **kwargs)

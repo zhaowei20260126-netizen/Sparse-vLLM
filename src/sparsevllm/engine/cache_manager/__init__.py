@@ -22,6 +22,8 @@ __all__ = [
     "DeltaKVSnapKVCacheManager",
     "AttnPredictCacheManager",
     "AttnPredictOffloadCacheManager",
+    "PredictiveOffloadCacheManager",
+    "SIEMACacheManager",
 ]
 
 
@@ -79,5 +81,13 @@ def __getattr__(name: str):
         from .attnpredict_offload import AttnPredictOffloadCacheManager
 
         return AttnPredictOffloadCacheManager
+    if name == "PredictiveOffloadCacheManager":
+        from .predictive_offload import PredictiveOffloadCacheManager
+
+        return PredictiveOffloadCacheManager
+    if name == "SIEMACacheManager":
+        from .siema import SIEMACacheManager
+
+        return SIEMACacheManager
 
     raise AttributeError(name)

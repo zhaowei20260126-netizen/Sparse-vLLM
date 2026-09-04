@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+
 import torch
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
@@ -37,7 +38,10 @@ class SparseController:
         self.is_deltakv_standalone = self.sparse_method == 'deltakv-standalone'
         self.is_deltakv_snapkv = self.sparse_method == 'deltakv-snapkv'
         self.is_deltakv_standalone_like = self.sparse_method in ('deltakv-standalone', 'deltakv-snapkv')
-        self.is_attnpredict_family = self.sparse_method in ('attnpredict', 'attnpredict-offload')
+        self.is_predictive_offload = self.sparse_method in (
+            "attnpredict-offload",
+            "siema",
+        )
         
         self.config = config
         self.cache_manager = cache_manager
@@ -207,9 +211,8 @@ class SparseController:
         返回 (active_slots, active_indices, req_indices, context_lens, attn_score, temp_slots)
         """
         sparse_state = self.layer_batch_sparse_states[layer_idx]
-        # TODO attnpredict每层都需要预测吧？
-        if (self.sparse_method in ("omnikv", "deltakv", "attnpredict", "attnpredict-offload") and layer_idx in self.full_attn_layers) or \
-            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', 'streamingllm', 'attention-sink', 'attention_sink', 'attnpredict', 'attnpredict-offload', ''):
+        if (self.sparse_method in ("omnikv", "deltakv") and layer_idx in self.full_attn_layers) or \
+            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', 'streamingllm', 'attention-sink', 'attention_sink', 'attnpredict', 'attnpredict-offload', 'siema', 'oracle-trace', ''):
 
             return (
                 self.cache_manager.get_layer_buffer_req_to_token_slots(layer_idx),  # 全部 token slots
@@ -331,10 +334,18 @@ class SparseController:
     def on_attention_end(self, layer_idx: int, context):
         """Attention kernel 完成后的轻量回调。
 
-        attnpredict-offload 需要在 attention logits 写完后尽早提交后台预测和
+        预测式卸载方法需要在 attention logits 写完后尽早提交后台预测和
         CPU->GPU 预取，这个时机早于 model layer 的 MLP 结束。
         """
-        if self.sparse_method != 'attnpredict-offload':
+        if self.sparse_method == "oracle-trace":
+            state = self.layer_batch_sparse_states[layer_idx]
+            if context.is_prefill:
+                self.cache_manager.on_prefill_layer_end(layer_idx)
+            elif state.attn_score is not None:
+                self.cache_manager.record_decode_attention(layer_idx, state.attn_score)
+            return
+
+        if not self.is_predictive_offload:
             return
 
         if context.is_prefill:
@@ -610,7 +621,7 @@ class SparseController:
 
         combined_scores = torch.stack(layer_scores, dim=0).max(dim=0).values
         self.cache_manager.deltakv_snapkv_finalize_static_prune(finalize_seqs, combined_scores)
-    
+
     def _needs_attn_score(self, layer_idx: int, is_prefill: bool, seqs: list[Sequence]) -> bool:
         """判断某一层在本轮前向中是否需要分配 attn_score 张量来收集注意力分数。
 
@@ -633,7 +644,9 @@ class SparseController:
         # prefill 不需要（不做预测，全量 attention）。
         if self.sparse_method == 'attnpredict':
             return not is_prefill
-        if self.sparse_method == 'attnpredict-offload':
+        if self.sparse_method == "oracle-trace":
+            return (not is_prefill) and self.cache_manager.should_collect_decode_attn_score(layer_idx)
+        if self.is_predictive_offload:
             return (not is_prefill) and self.cache_manager.should_collect_decode_attn_score(layer_idx)
 
         if self.sparse_method == 'deltakv-snapkv':

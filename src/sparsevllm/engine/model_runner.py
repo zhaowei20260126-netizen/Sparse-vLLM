@@ -262,7 +262,7 @@ class ModelRunner:
 
         load_deltakv_compressors_to_cache_manager(self.cache_manager, self.config.deltakv_path)
 
-    def free_slots(self, seq_id: int):
+    def free_slots(self, seq_id: int, sequence_finished: bool = False):
         """通知 CacheManager 释放该序列占用的物理显存位子"""
         with profiler.record("model_free_slots"):
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":

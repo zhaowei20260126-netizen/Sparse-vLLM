@@ -1,0 +1,1651 @@
+from __future__ import annotations
+
+import os
+import threading
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+
+import numpy as np
+import torch
+
+from sparsevllm.config import Config
+from sparsevllm.engine.sequence import Sequence
+from sparsevllm.utils.context import get_context
+from sparsevllm.utils.log import logger
+from sparsevllm.utils.profiler import profiler
+
+from ._predictive_offload import PredictiveResidencyMixin, PredictiveTransferMixin
+from .base import CacheManager, LayerBatchStates
+
+
+def prediction_block_window(
+    num_blocks: int,
+    *,
+    sink_tokens: int,
+    recent_tokens: int,
+    block_size: int,
+) -> tuple[int, int]:
+    """返回热 block 候选区间。"""
+    start = min(max(0, int(num_blocks)), max(0, int(sink_tokens)) // block_size)
+    end = max(0, int(num_blocks)) - max(0, int(recent_tokens)) // block_size
+    return start, max(start, end)
+
+
+def hot_block_budget(
+    *,
+    topk_tokens: int,
+    sink_tokens: int,
+    recent_tokens: int,
+    block_size: int,
+    candidate_blocks: int,
+) -> int:
+    """将 token 预算换算成热 block 数。"""
+    middle_tokens = int(topk_tokens) - int(sink_tokens) - int(recent_tokens)
+    return max(0, min(middle_tokens // block_size, int(candidate_blocks)))
+
+
+def select_hot_block_indices(scores: torch.Tensor, budget: int) -> torch.Tensor:
+    """聚合各 head 分数并选出 Top-K block。"""
+    shared = scores if scores.dim() == 1 else scores.amax(dim=0)
+    budget = max(0, min(int(budget), int(shared.numel())))
+    if budget == 0:
+        return torch.empty(0, dtype=torch.long, device=shared.device)
+    return torch.topk(shared, budget, dim=-1, sorted=False).indices
+
+
+def tail_causal_observed_block_mask(
+    *,
+    full_len: int,
+    history_rows: int,
+    num_blocks: int,
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """返回 prefill 尾部每个 query 实际可见的 block 掩码。"""
+    query_positions = torch.arange(
+        int(full_len) - int(history_rows),
+        int(full_len),
+        device=device,
+    )
+    block_starts = torch.arange(int(num_blocks), device=device) * int(block_size)
+    return block_starts.unsqueeze(0) <= query_positions.unsqueeze(1)
+
+
+class PredictiveOffloadCacheManager(
+    PredictiveResidencyMixin,
+    PredictiveTransferMixin,
+    CacheManager,
+):
+    """预测式稀疏方法共享的 KV 卸载、Lease 和异步预取实现。
+
+    核心思路：
+    1. GPU 只保存“当前要参与 attention 的 active KV”，也就是一个可复用的 active slot 池。
+    2. CPU 保存完整历史 KV，作为 full backing。某个历史 token 被 GPU 驱逐后，
+       之后 predictor 又选中了它，就可以从 CPU 拿回来。
+    3. decode 时每层 attention 结束后，后台线程在独立 CUDA stream 上预测下一步 mask，
+       并预取下一步需要的 KV；下一步走到同一层时再等待该层预取完成。
+
+    注意：这里刻意不调用 ``StandardCacheManager.__init__``。标准 cache manager 假设
+    “每个 token 在 GPU 上长期占一个 slot”，而 offload 版本需要 per-layer active pool
+    和 CPU full backing 两套元数据，所以只复用基类的模型尺寸/配置初始化。
+
+    decode lease 状态机（理解本文件最关键的一段）：
+    一份 lease 是“某段连续 decode step 内可复用的预测结果”，由四组 per-layer 状态构成，
+    生命周期分四步，跨多个函数：
+      1. predict：源层 attention 结束后，``predict_next_mask()`` 把分数聚合、预测和 Top-K
+         放到后台线程，算出新的热位置。组内其余层复用源层结果。
+      2. prefetch：后台 worker 调 ``_ensure_positions_loaded()`` 只把缺失 KV 从 CPU 加载到
+         GPU active pool（只加载、不释放旧 resident），完成后记录一个 CUDA event。
+      3. commit：下一次同层消费时 ``_consume_prefetch()`` 等 event，再 ``_commit_lease()``
+         把新结果写进 ``_lease_hot_positions``/``_lease_start_positions``，并失效
+         ``_static_view_cache``（因为 sink+hot 集合变了）。decode worker 还会置
+         ``_pending_residency_cleanup=True``。
+      4. cleanup：每层下一次 ``get_layer_store_view()`` 到达自身写入点时，才用
+         ``_ensure_positions_resident()`` 驱逐旧 lease 不再需要的 resident（dirty token
+         驱逐前先 D2H 写回 CPU backing）。这样驱逐成本分摊到各层，不在 step 开头集中爆发。
+    相关状态：``_lease_hot_positions``（当前复用的 hot positions）、``_lease_start_positions``
+    （row -> lease 起始 decode 位置，用于算 lease 年龄）、``_static_view_cache``（lease 内
+    稳定的 sink+hot slots 缓存）、``_dirty_gpu_positions``（GPU 有、CPU backing 未写回的新 KV）。
+    """
+
+    def _init_predictor(self, config: Config) -> None:
+        """由具体预测器初始化自身状态。"""
+        raise NotImplementedError
+
+    def _free_predictor_row(self, row_idx: int) -> None:
+        """由具体预测器释放一条序列的状态。"""
+        raise NotImplementedError
+
+    def _update_predictor_scores_from_pooled(
+        self,
+        layer_idx: int,
+        row_idx: int,
+        block_scores: torch.Tensor,
+        *,
+        observed_block_mask: torch.Tensor | None = None,
+        step_position: int | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """更新预测器并返回候选区间的 block 分数和起始位置。"""
+        raise NotImplementedError
+
+    def __init__(self, config: Config, rank: int, world_size: int):
+        """初始化 GPU 活跃池、CPU 完整后备缓存和异步预取资源。"""
+        CacheManager.__init__(self, config, rank, world_size)
+        # CPU 后备缓存和逐层活跃池元数据尚未支持张量并行分片。
+        assert world_size == 1, "预测式卸载方法目前仅支持 tensor_parallel_size=1。"
+        # 分配 GPU active KV pool 和 CPU full KV backing
+        self.allocate_kv_cache()
+
+        # ------------------------------------------------------------------
+        # GPU active pool 元数据
+        # ------------------------------------------------------------------
+        # 每层都有一套独立的 GPU slot 池。slot 里只放当前驻留 GPU 的 token KV，
+        # 不再表示“这个序列的完整历史都在 GPU 上”。
+        num_slots = config.num_kvcache_slots
+        self.layer_num_slots = [num_slots for _ in range(self.num_layers)]
+        self.free_slots_stack: list[list[int]] = [list(range(num_slots)) for _ in range(self.num_layers)]
+        self._num_free_slots = [num_slots for _ in range(self.num_layers)]
+
+        # GPU 侧 row -> slot 映射。prefill 用完整映射；decode attention
+        # 只读 build_decode_view() 产出的 packed slots。给 GPU / attention / 通用接口用。
+        self.buffer_req_to_token_slots = [
+            torch.full((self.max_buffer_rows, self.max_model_len), -1, dtype=torch.int32, device="cuda")
+            for _ in range(self.num_layers)
+        ]
+
+        # CPU 侧镜像，方便 Python 后台线程快速判断某个 token 是否已驻留 GPU。
+        # 语义与 buffer_req_to_token_slots 相同，但存在 CPU numpy 数组里。
+        self.gpu_req_to_token_slots_cpu = [
+            np.full((self.max_buffer_rows, self.max_model_len), -1, dtype=np.int32)
+            for _ in range(self.num_layers)
+        ]
+        self.layer_batch_states = [LayerBatchStates() for _ in range(self.num_layers)]
+
+        # ------------------------------------------------------------------
+        # 序列行号元数据
+        # ------------------------------------------------------------------
+        # seq_id_to_row 将外部序列 id 映射到 cache manager 内部的 row。
+        # row_seq_lens 记录每个 row 当前完整逻辑长度，也就是 CPU full backing 已保存的 token 数。
+        self.seq_id_to_row: dict[int, int] = {}
+        self.free_rows = deque(range(self.max_buffer_rows))
+        self.row_seq_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
+
+        # ------------------------------------------------------------------
+        # CPU full KV backing 元数据
+        # ------------------------------------------------------------------
+        # CPU 侧 row -> cpu_slot 映射。只要 token 进入过 KV cache，这里就应该能找到
+        # 它完整 K/V 在 CPU full backing 中的位置。
+        self.cpu_req_to_token_slots = np.full(
+            (self.max_buffer_rows, self.max_model_len),
+            -1,
+            dtype=np.int64,
+        )
+        self.cpu_free_slots_stack: list[int] = list(range(self.cpu_num_slots))
+        self._num_free_cpu_slots = self.cpu_num_slots
+        # CPU 槽的“已分配”和“数据有效”是两个独立状态。
+        # decode token 会立即占有逻辑槽，但 D2H 完成后才有有效后备副本。
+        self._cpu_backed_valid = np.zeros(
+            (self.num_layers, self.cpu_num_slots), dtype=np.bool_
+        )
+
+        # 本轮 forward 中每个 token 对应的 CPU slot。attention.py 写完 GPU KV 后，
+        # on_kv_stored() 会用它把同一批 K/V 复制到 CPU full backing。
+        self._layer_cpu_slot_mapping: list[np.ndarray | None] = [None for _ in range(self.num_layers)]
+        # decode 当前 step 的 row 和当前位置。get_layer_store_view() 逐层消费时会用它
+        # 构造“本层需要先确保驻留 GPU 的历史位置”。
+        self._decode_current_positions = np.empty((0,), dtype=np.int64)
+        self._decode_rows = np.empty((0,), dtype=np.int64)
+
+        # 每层本轮 decode 实际要读的逻辑 token positions。get_layer_store_view() 先准备，
+        # build_decode_view() 再把它转换成 packed GPU slots 交给 decode kernel。
+        self._decode_view_positions: list[list[np.ndarray] | None] = [None for _ in range(self.num_layers)]
+        # 每层当前正在复用的 hot positions；sink/recent/current 每步动态拼接。
+        self._lease_hot_positions: list[dict[int, np.ndarray] | None] = [None for _ in range(self.num_layers)]
+        # hot positions 仍用于构造 attention view；缓存管理只比较 block id，避免
+        # 每次 lease 刷新都对约 topk 个 token 重建 Python set。
+        self._lease_hot_blocks: list[dict[int, np.ndarray] | None] = [None for _ in range(self.num_layers)]
+        # row -> 这份预测结果从哪个 decode 位置开始使用。
+        self._lease_start_positions: list[dict[int, int]] = [dict() for _ in range(self.num_layers)]
+        # 每隔多少个 decode step 重新预测。
+        self._reuse_steps = config.attnpredict_reuse_steps
+        # 后台预测过慢时最多复用几步旧 lease。
+        self._max_stale_steps = config.attnpredict_max_stale_steps
+        # 每隔多少层复用组首层 predictor 结果；与 reuse/max_stale 同为核心消融旋钮。
+        self._layer_reuse_stride = config.attnpredict_layer_reuse_stride
+        # 前 N 层完整驻留并执行完整注意力；之后才按层组运行预测器。
+        self._num_full_layers = min(
+            self.num_layers, int(config.attnpredict_num_full_layers)
+        )
+
+        self.topk = int(config.num_top_tokens)
+        self.history_step = int(config.attnpredict_history_steps)
+        self.pooling_block_size = int(config.attnpredict_pooling_block_size)
+        self.sink_token = int(config.num_sink_tokens)
+        self.local_token = int(config.num_recent_tokens)
+        self.attn_scale = self.head_dim**-0.5
+        self._last_decode_view: list[dict[str, object] | None] = [
+            None for _ in range(self.num_layers)
+        ]
+        self._init_predictor(config)
+
+        # ------------------------------------------------------------------
+        # 异步预取资源
+        # ------------------------------------------------------------------
+        # 后台 CPU 线程负责提交 predictor/prefetch 任务；单条 CUDA stream
+        # 避免多组 predictor/H2D 并发抢占主计算流。
+        cpu_threads = config.attnpredict_offload_cpu_threads or 1
+        # 控制 CPU 侧 PyTorch 算子线程数，不影响 GPU kernel 线程数。
+        torch.set_num_threads(cpu_threads)
+        # 后台线程池负责提交 predictor、prefetch 和 CPU residency 任务。
+        self._prefetch_executor = ThreadPoolExecutor(max_workers=cpu_threads)
+        self._prefetch_stream = torch.cuda.Stream(priority=0)
+        self._init_transfer_pipeline(config)
+        # 每层一个 future 句柄；结果可能覆盖组内多个 layer。
+        self._prefetch_futures: list[Future | None] = [None for _ in range(self.num_layers)]
+        # 异步 decode 切到新 lease 后，各层到达自身写入点时再释放旧 resident。
+        # 由 decode worker 返回的 needs_cleanup 触发：_consume_prefetch 据此置位，
+        # 再由 get_layer_store_view 在该层到达写入点时执行旧 resident 驱逐。
+        self._pending_residency_cleanup = [False for _ in range(self.num_layers)]
+        # attention 完成后再提交 prefill D2H，使复制尽量与后续 MLP 重叠。
+        self._pending_prefill_writebacks: list[
+            tuple[torch.Tensor, torch.Tensor, np.ndarray] | None
+        ] = [None for _ in range(self.num_layers)]
+        self._pending_prefill_views: list[dict[str, object] | None] = [None for _ in range(self.num_layers)]
+        # 主线程和后台线程都会改同层 active pool 元数据。
+        self._layer_locks = [threading.RLock() for _ in range(self.num_layers)]
+        # decode 新 KV 先留在 GPU；只有驱逐 dirty token 时才补写 CPU backing。
+        self._dirty_gpu_positions: list[set[tuple[int, int]]] = [set() for _ in range(self.num_layers)]
+        # GPU 驻留位置集合，避免每次从 mirror[row, :full_len] 扫完整长上下文。
+        self._resident_positions: list[dict[int, set[int]]] = [dict() for _ in range(self.num_layers)]
+        # 当前 attention 工作集与 GPU 驻留集分离。
+        self._active_positions: list[dict[int, set[int]]] = [dict() for _ in range(self.num_layers)]
+        # lease-aware 用两代 block 集合表达生命周期。active 是当前 lease，grace
+        # 是上一代且当前不再使用的 block；更老的 block 在刷新时直接回收。
+        self._lease_active_blocks: list[dict[int, set[int]]] = [dict() for _ in range(self.num_layers)]
+        self._lease_grace_blocks: list[dict[int, set[int]]] = [dict() for _ in range(self.num_layers)]
+        self._residency_policy = str(config.attnpredict_offload_residency_policy)
+        max_free_watermark = max(0, num_slots - 1)
+        configured_critical = int(
+            config.attnpredict_offload_free_critical_watermark_tokens
+        )
+        self._free_critical_watermark = min(
+            max_free_watermark,
+            max(1, 2 * int(config.max_num_seqs_in_batch))
+            if configured_critical < 0
+            else configured_critical,
+        )
+        self._h2d_load_tokens = 0
+        self._lease_grace_evictions = 0
+        # row -> (lease_start, static_len, static_slots_gpu, static_positions_gpu)，recent/current 动态补。
+        self._static_view_cache: list[dict[int, tuple[int, int, torch.Tensor, torch.Tensor | None]]] = [
+            dict() for _ in range(self.num_layers)
+        ]
+        # 记录 decode view 最大长度，避免 hot path 从 GPU Tensor 上 .item()。
+        self._decode_view_max_lens = [1 for _ in range(self.num_layers)]
+        # 复用 packed slots/positions/local req indices，减少每层每步分配。
+        self._packed_slots_cache: list[torch.Tensor | None] = [None for _ in range(self.num_layers)]
+        self._packed_positions_cache: list[torch.Tensor | None] = [None for _ in range(self.num_layers)]
+        self._local_req_indices_cache: torch.Tensor | None = None
+        # 本轮 decode 是否需要 positions metadata；只在预测步为 source layer 构造。
+        self._collect_decode_positions = [False for _ in range(self.num_layers)]
+        # top-k block 展开成 token positions 时复用 GPU offsets。
+        self._pooling_offsets_gpu = torch.arange(int(self.pooling_block_size), device="cuda")
+        logger.info(
+            "Predictive offload allocation: gpu_active_slots={} cpu_full_slots={} "
+            "layers={} async_prefetch=always cpu_threads={} reuse_steps={} max_stale_steps={} "
+            "layer_reuse_stride={} full_layers={} predictor={} staging_slots={} "
+            "staging_chunk_tokens={} residency_policy={} critical_watermark={}".format(
+                num_slots,
+                self.cpu_num_slots,
+                self.num_layers,
+                cpu_threads,
+                self._reuse_steps,
+                self._max_stale_steps,
+                self._layer_reuse_stride,
+                self._num_full_layers,
+                self.predictor_name,
+                self._staging_slot_count,
+                self._staging_chunk_tokens,
+                self._residency_policy,
+                self._free_critical_watermark,
+            )
+        )
+
+    def allocate_kv_cache(self):
+        """分配 GPU active KV pool 和 CPU full KV backing。
+
+        GPU cache 仍然是标准形状：
+            [2, num_layers, num_gpu_slots, num_kv_heads, head_dim]
+
+        但它的语义和 vanilla 不同：这里的 GPU slot 是 active pool，
+        只保存当前驻留 GPU、会被 attention kernel 读取的 token。
+        CPU cache 则为每层分别保存完整 K/V，用于恢复已驱逐 token。
+        """
+        available_memory, slot_bytes_per_layer = self._get_available_slots_info()
+        slot_bytes = self.num_layers * slot_bytes_per_layer
+        capacity_slots = max(1, int(available_memory // slot_bytes))
+        full_resident_target = self.max_model_len * max(1, self.config.max_num_seqs_in_batch) # 全量驻留目标容量，即“最坏情况下要在 GPU 里容纳多少个 token 的 KV slot”
+        explicit_slots = int(self.config.num_kvcache_slots)
+        target_slots = explicit_slots if explicit_slots > 0 else full_resident_target
+        self.config.num_kvcache_slots = max(1, min(capacity_slots, target_slots))
+
+        # GPU active KV pool。每层都有 config.num_kvcache_slots 个可复用 slot。
+        self.kv_cache = torch.empty(
+            2,
+            self.num_layers,
+            self.config.num_kvcache_slots,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=self.hf_config.torch_dtype,
+            device="cuda",
+        )
+
+        # CPU full KV backing。布局和 GPU kv_cache 保持一致：
+        #   cpu_kv_cache[0, layer, slot] 是 K
+        #   cpu_kv_cache[1, layer, slot] 是 V
+        self.cpu_num_slots = self._compute_cpu_num_slots()
+        self.cpu_kv_cache = torch.empty(
+            2,
+            self.num_layers,
+            self.cpu_num_slots,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=self.hf_config.torch_dtype,
+            device="cpu",
+        )
+
+    def _compute_cpu_num_slots(self) -> int:
+        """计算 CPU full backing 可以容纳多少 token slot。
+
+        如果用户配置 attnpredict_offload_cpu_slots > 0，就完全尊重用户配置。
+        否则自动估算：
+        1. 目标值先取 max_model_len * max_num_seqs_in_batch。
+        2. 再根据系统可用 CPU 内存和 attnpredict_offload_cpu_memory_utilization
+           估算最多能放多少完整 KV。
+        3. 取二者较小值，避免默认情况下把 CPU 内存吃满。
+        """
+        explicit = int(getattr(self.config, "attnpredict_offload_cpu_slots", -1) or -1)
+        if explicit > 0:
+            return explicit
+
+        # 一个 token 跨所有层的完整 KV 占用：
+        # num_layers * 2(K/V) * num_kv_heads * head_dim * dtype_size。
+        dtype_size = torch.tensor([], dtype=self.hf_config.torch_dtype).element_size()
+        bytes_per_slot_all_layers = (
+            self.num_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size
+        )
+
+        # CPU backing 保存完整逻辑上下文，不按 GPU active pool 容量裁剪。
+        desired = self.max_model_len * max(1, self.config.max_num_seqs_in_batch)
+        mem_available = self._cpu_mem_available_bytes()
+        if mem_available > 0 and bytes_per_slot_all_layers > 0:
+            # 只用可用内存的一部分做预算，给系统、dataloader、Python 对象等留余量。
+            cpu_mem_ratio = float(self.config.attnpredict_offload_cpu_memory_utilization)
+            by_mem = int((mem_available * cpu_mem_ratio) // bytes_per_slot_all_layers)
+            desired = min(desired, max(1, by_mem))
+        return max(1, desired)
+
+    @staticmethod
+    def _cpu_mem_available_bytes() -> int:
+        """读取当前机器可用 CPU 内存，返回字节数。
+
+        Linux 下优先读取 /proc/meminfo 的 MemAvailable。它比 MemFree 更合理，
+        因为它把可回收 page cache 也算进“可用”。
+        """
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        try:
+            pages = os.sysconf("SC_AVPHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return int(pages) * int(page_size)
+        except (ValueError, OSError, AttributeError):
+            return 0
+
+    def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
+        """返回某一层当前 batch 的基础元数据：写入 slot、context_lens、row indices。"""
+        return self.layer_batch_states[layer_idx]
+
+    def get_layer_kv_cache(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回某层 GPU active pool 中的 K/V cache 张量。"""
+        return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx]
+
+    def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
+        """该方法直接使用逐层 K/V，不需要额外重构张量。"""
+        raise NotImplementedError
+
+    def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
+        """返回某层 GPU 侧 row/pos -> active slot 映射表。"""
+        return self.buffer_req_to_token_slots[layer_idx]
+
+    @property
+    def num_free_slots(self) -> int:
+        """调度器看到的可用 slot 数。
+
+        decode 新 token 既需要 CPU full backing slot，也可能需要 GPU active slot；
+        因此这里取 GPU 剩余和 CPU 剩余的较小值，作为保守准入依据。
+        """
+        gpu_free = min(self._num_free_slots)
+        return min(gpu_free, self._num_free_cpu_slots)
+
+    def prompt_admission_free_slots(self) -> int:
+        """prompt 准入时使用的可用容量。
+
+        prefill token 必须同时写入 GPU active pool 和 CPU full backing，
+        num_free_slots 已经取了 GPU/CPU 两侧的较小值。
+        """
+        return self.num_free_slots
+
+    def free_slot_stats(self) -> dict[str, int]:
+        """返回调试日志用的 GPU/CPU 剩余 slot 统计。"""
+        gpu_free = min(self._num_free_slots)
+        return {
+            "free_slots": self.num_free_slots,
+            "free_gpu_active_slots": gpu_free,
+            "free_cpu_full_slots": self._num_free_cpu_slots,
+        }
+
+    def offload_page_cache_stats(self) -> dict[str, int | float | str]:
+        """返回论文实验需要的核心传输与驻留统计。"""
+        layer_resident = [
+            capacity - free
+            for capacity, free in zip(
+                self.layer_num_slots, self._num_free_slots
+            )
+        ]
+        resident = sum(layer_resident)
+        full_layer_active = sum(layer_resident[: self._num_full_layers])
+        sparse_layer_start = self._num_full_layers
+        if self._residency_policy == "lease-aware":
+            block_size = int(self.pooling_block_size)
+            sparse_active = sum(
+                min(
+                    block_size,
+                    max(0, int(self.row_seq_lens[row]) - block * block_size),
+                )
+                for layer_rows in self._lease_active_blocks[sparse_layer_start:]
+                for row, blocks in layer_rows.items()
+                for block in blocks
+            )
+        else:
+            sparse_active = sum(
+                len(positions)
+                for layer_rows in self._active_positions[sparse_layer_start:]
+                for positions in layer_rows.values()
+            )
+        active = full_layer_active + sparse_active
+        return {
+            "residency_policy": self._residency_policy,
+            "resident_positions": resident,
+            "active_positions": active,
+            "inactive_resident_positions": max(0, resident - active),
+            "backed_cpu_layer_slots": int(self._cpu_backed_valid.sum()),
+            "dirty_gpu_positions": sum(
+                len(layer_dirty) for layer_dirty in self._dirty_gpu_positions
+            ),
+            "h2d_load_tokens": self._h2d_load_tokens,
+            "h2d_load_bytes": (
+                self._h2d_load_tokens
+                * 2
+                * self.num_kv_heads
+                * self.head_dim
+                * self.kv_cache.element_size()
+            ),
+            "lease_grace_evictions": self._lease_grace_evictions,
+            "dirty_writeback_bytes": self._dirty_writeback_bytes,
+            "prefill_writeback_bytes": self._prefill_writeback_bytes,
+            "prefill_writeback_backpressure_s": self._prefill_writeback_backpressure_s,
+            "prefill_writeback_barrier_s": self._prefill_writeback_barrier_s,
+            "free_critical_watermark": self._free_critical_watermark,
+        }
+
+    def prefill_batched_tokens_margin(self) -> int:
+        """给 chunk prefill 预留的 token 预算余量。
+
+        AttentionPredictor 需要最后 history_step 个 query 来初始化历史，
+        因此调度时留一点 batch token 余量，避免最后一段被切得太小。
+        """
+        return self.config.attnpredict_history_steps
+
+    def remaining_prefill_tokens(self, seq: Sequence) -> int:
+        """返回调度器本轮还应该继续 prefill 的 token 数。
+
+        这里沿用 SnapKV/StreamingLLM 的“保留尾部窗口”写法：
+        如果剩余 token 多于 history_step，就先只推进到尾部 history_step 之前，
+        让最后一块有足够 query 用于初始化 predictor history。
+        """
+        remaining = seq.num_prompt_tokens - seq.num_prefilled_tokens
+        history = self.config.attnpredict_history_steps
+        if history > 0 and remaining > history:
+            return remaining - history
+        return remaining
+
+    def _get_free_row(self, seq_id: int) -> int:
+        """获取序列在元数据表里的 row；没有则分配一个新 row。"""
+        if seq_id in self.seq_id_to_row:
+            return self.seq_id_to_row[seq_id]
+        if not self.free_rows:
+            raise RuntimeError("No free rows in AttnPredict offload cache manager.")
+        row_idx = self.free_rows.popleft()
+        self.seq_id_to_row[seq_id] = row_idx
+        return row_idx
+
+    def _allocate_cpu_slots(self, seq_id: int, size: int) -> np.ndarray:
+        """为某个序列的新 token 分配 CPU full backing slots。
+
+        CPU slot 是跨层共享的逻辑 token slot：同一个 cpu_slot 在每一层的
+        cpu_kv_cache[0/1, layer, slot] 中保存该 token 对应层的 K/V。
+        """
+        if self._num_free_cpu_slots < size:
+            raise RuntimeError(
+                f"Out of AttnPredict CPU full-KV slots: need={size}, free={self._num_free_cpu_slots}"
+            )
+        row_idx = self._get_free_row(seq_id)
+        cur_len = self.row_seq_lens[row_idx]
+
+        # row_seq_lens 是完整逻辑长度，不能超过 max_model_len 对应的映射表宽度。
+        if cur_len + size > self.max_model_len:
+            raise RuntimeError(
+                f"AttnPredict offload sequence exceeds max_model_len: "
+                f"seq_id={seq_id} cur_len={cur_len} add={size} max={self.max_model_len}"
+            )
+
+        # 从 free stack 末尾弹出 size 个 CPU slot，并写入 row/pos -> cpu_slot 表。
+        slots = np.asarray(self.cpu_free_slots_stack[-size:], dtype=np.int64)
+        del self.cpu_free_slots_stack[-size:]
+        self._num_free_cpu_slots -= size
+        self._cpu_backed_valid[:, slots] = False
+        self.cpu_req_to_token_slots[row_idx, cur_len:cur_len + size] = slots
+        self.row_seq_lens[row_idx] += size
+        return slots
+
+    def _compose_positions_from_hot(self, hot_positions: np.ndarray, full_len: int) -> np.ndarray:
+        """把复用 hot tokens 和当前步动态 sink/recent 合成完整可见 positions。"""
+        sink_end = min(self.sink_token, full_len)
+        recent_start = max(sink_end, full_len - self.local_token)
+        parts = [np.arange(0, sink_end, dtype=np.int64)]
+        if hot_positions.size:
+            hot = hot_positions[(hot_positions >= sink_end) & (hot_positions < recent_start)]
+            if hot.size:
+                parts.append(hot.astype(np.int64, copy=False))
+        parts.append(np.arange(recent_start, full_len, dtype=np.int64))
+        # sink/hot/recent 已经有序且互不重叠，避免每层每步重新排序去重。
+        return np.concatenate(parts) if parts else np.empty((0,), dtype=np.int64)
+
+    def _compose_static_positions_from_hot(self, hot_positions: np.ndarray, full_len: int) -> np.ndarray:
+        """返回 lease 内稳定的 sink/hot positions；recent/current 每步动态补。"""
+        sink_end = min(self.sink_token, full_len)
+        recent_start = max(sink_end, full_len - self.local_token)
+        parts = [np.arange(0, sink_end, dtype=np.int64)]
+        if hot_positions.size:
+            hot = hot_positions[(hot_positions >= sink_end) & (hot_positions < recent_start)]
+            if hot.size:
+                parts.append(hot.astype(np.int64, copy=False))
+        return np.concatenate(parts) if parts else np.empty((0,), dtype=np.int64)
+
+    def _hot_positions_from_scores(
+        self,
+        tsp_attn: torch.Tensor,
+        *,
+        seq_len: int,
+        start_block: int,
+    ) -> np.ndarray:
+        """从 block score 直接生成中间 hot positions。"""
+        pred_len = int(tsp_attn.shape[-1])
+        block_budget = hot_block_budget(
+            topk_tokens=self.topk,
+            sink_tokens=self.sink_token,
+            recent_tokens=self.local_token,
+            block_size=self.pooling_block_size,
+            candidate_blocks=pred_len,
+        )
+        if seq_len <= 0 or block_budget <= 0:
+            return np.empty((0,), dtype=np.int64)
+
+        topk_indices = select_hot_block_indices(tsp_attn, block_budget)
+        token_indices = (
+            (topk_indices + int(start_block)).unsqueeze(-1) * int(self.pooling_block_size)
+            + self._pooling_offsets_gpu
+        ).reshape(-1)
+        sink_end = min(int(self.sink_token), int(seq_len))
+        recent_start = max(sink_end, int(seq_len) - int(self.local_token))
+        valid = (token_indices >= sink_end) & (token_indices < recent_start)
+        # topk block 不重复，展开后的 token 也不重复；排序后一次性拷回 CPU。
+        token_indices = token_indices[valid].sort().values
+        return token_indices.to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=False)
+
+    def _select_row_hot_positions(
+        self,
+        layer_idx: int,
+        row_idx: int,
+        scores: torch.Tensor,
+        *,
+        seq_len: int,
+        start_block: int,
+    ) -> np.ndarray:
+        """选择一行的新 Lease；子类可融合 query 相关信号。"""
+        del layer_idx, row_idx
+        return self._hot_positions_from_scores(
+            scores,
+            seq_len=seq_len,
+            start_block=start_block,
+        )
+
+    def _commit_lease(
+        self,
+        layer_idx: int,
+        hot_positions: dict[int, np.ndarray],
+        hot_blocks: dict[int, np.ndarray],
+        lease_start_positions: dict[int, int],
+    ) -> None:
+        """提交已完成预取的 lease；之后 decode 才会切到新预测结果。"""
+        lease = self._lease_hot_positions[layer_idx]
+        if lease is None:
+            lease = {}
+            self._lease_hot_positions[layer_idx] = lease
+        # 连续 batching 中新 row 可能单独完成 prefill，不能覆盖仍在 decode 的旧 row。
+        lease.update(hot_positions)
+        lease_blocks = self._lease_hot_blocks[layer_idx]
+        if lease_blocks is None:
+            lease_blocks = {}
+            self._lease_hot_blocks[layer_idx] = lease_blocks
+        lease_blocks.update(hot_blocks)
+        self._lease_start_positions[layer_idx].update(lease_start_positions)
+        #保存的是该层sink + hot 这部分稳定位置对应的 GPU slots
+        #因为 sink + hot 在同一个 lease 内不变，所以 build_decode_view() 不想每一步都重新构造它，就缓存起来
+        cache = self._static_view_cache[layer_idx]
+        for row_idx in lease_start_positions:
+            cache.pop(row_idx, None)
+
+    def _is_layer_reuse_source(self, layer_idx: int) -> bool:
+        """本层是否真正跑 predictor；组内其他层复用它。"""
+        return (
+            layer_idx >= self._num_full_layers
+            and (layer_idx - self._num_full_layers) % self._layer_reuse_stride == 0
+        )
+
+    def is_full_attention_layer(self, layer_idx: int) -> bool:
+        """本层是否在 decode 阶段保留并读取完整 KV。"""
+        return layer_idx < self._num_full_layers
+
+    def _layer_reuse_targets(self, layer_idx: int) -> range:
+        """返回组首层预测结果覆盖的层范围。"""
+        end = min(self.num_layers, layer_idx + self._layer_reuse_stride)
+        return range(layer_idx, end)
+
+    def _expand_layer_results(
+        self,
+        layer_idx: int,
+        hot_positions: dict[int, np.ndarray],
+        lease_starts: dict[int, int],
+    ) -> dict[int, dict[str, object]]:
+        """把复用组首层预测结果映射到组内层。"""
+        block_size = int(self.pooling_block_size)
+        hot_blocks = {
+            row_idx: np.unique(positions // block_size).astype(np.int32, copy=False)
+            for row_idx, positions in hot_positions.items()
+        }
+        return {
+            i: {
+                "hot_positions": hot_positions,
+                "hot_blocks": hot_blocks,
+                "lease_start_positions": lease_starts,
+            }
+            for i in self._layer_reuse_targets(layer_idx)
+        }
+
+    def _prefetch_layer_results(
+        self,
+        layer_results: dict[int, dict[str, object]],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """只预取新 Lease 缺失的历史 KV，不提前释放旧工作集。"""
+        for layer_idx, result in layer_results.items():
+            lease_starts = result["lease_start_positions"]
+            if self._residency_policy == "lease-aware":
+                row_positions = self._lease_prefetch_positions(
+                    layer_idx, result["hot_blocks"], lease_starts
+                )
+            else:
+                hot_positions = result["hot_positions"]
+                row_positions = {
+                    row: self._compose_positions_from_hot(
+                        hot_positions[row], full_len
+                    )[:-1]
+                    for row, full_len in lease_starts.items()
+                }
+            self._ensure_positions_loaded(
+                layer_idx, row_positions, stream=stream
+            )
+
+    def _commit_layer_results(
+        self,
+        layer_results: dict[int, dict[str, object]],
+    ) -> None:
+        """提交组内各层 lease。
+
+        组内每层共享同一份 hot_positions/lease_starts 对象，但不能直接赋值给
+        各层 lease：_commit_lease() 对每层的 _lease_hot_positions[layer_idx] 做
+        update() 合并（保留该层仍在 decode 的其他 row），并失效各自独立的
+        _static_view_cache[layer_idx]。这些都是 per-layer 状态，必须逐层提交。
+        """
+        for layer_idx, result in layer_results.items():
+            self._commit_lease(
+                layer_idx,
+                result["hot_positions"],
+                result["hot_blocks"],
+                result["lease_start_positions"],
+            )
+
+    def _get_packed_slots_buffer(self, layer_idx: int, batch_size: int, max_keep: int, device: torch.device) -> torch.Tensor:
+        """复用 decode packed slots；kernel 只读 view_lens 内的有效区域。"""
+        cached = self._packed_slots_cache[layer_idx]
+        if cached is None or cached.shape[0] < batch_size or cached.shape[1] < max_keep or cached.device != device:
+            cached = torch.empty((batch_size, max_keep), dtype=torch.int32, device=device)
+            self._packed_slots_cache[layer_idx] = cached
+        return cached[:batch_size, :max_keep]
+
+    def _get_packed_positions_buffer(self, layer_idx: int, batch_size: int, max_keep: int, device: torch.device) -> torch.Tensor:
+        """复用 source layer 的 packed positions。"""
+        cached = self._packed_positions_cache[layer_idx]
+        if cached is None or cached.shape[0] < batch_size or cached.shape[1] < max_keep or cached.device != device:
+            cached = torch.empty((batch_size, max_keep), dtype=torch.int32, device=device)
+            self._packed_positions_cache[layer_idx] = cached
+        return cached[:batch_size, :max_keep]
+
+    def _get_local_req_indices(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """local req indices 只和 batch size 有关，避免每层重复 arange。"""
+        cached = self._local_req_indices_cache
+        if cached is None or cached.numel() < batch_size or cached.device != device:
+            cached = torch.arange(batch_size, dtype=torch.int32, device=device)
+            self._local_req_indices_cache = cached
+        return cached[:batch_size]
+
+    def _consume_prefetch(self, layer_idx: int, *, wait: bool) -> bool:
+        """消费本层后台预测结果，返回是否真正切到新 lease。
+
+        三态：无后台任务 / 后台未完成且 wait=False -> 返回 False，继续用旧 lease；
+        后台完成（或 wait=True 强等）-> 提交新 lease 并返回 True。
+
+        注意：每层各自持有独立 future（predict_next_mask/on_prefill_layer_end 每层单独
+        submit），所以这里只需清空本层的 future 槽位。
+        """
+        future = self._prefetch_futures[layer_idx]
+        if future is None:
+            return False
+        if not wait and not future.done():
+            return False
+        with profiler.record("attnpredict_offload_prefetch_wait"):
+            result = future.result()
+            self._prefetch_futures[layer_idx] = None
+            # 主计算流等后台 event，保证 decode 读 KV 前后台搬运已落地。
+            torch.cuda.current_stream().wait_event(result["event"])
+            self._commit_layer_results(result["layer_results"])
+            # 解码线程只负责补齐缺页，旧驻留位置留到各层写入点统一清理。
+            if result.get("needs_cleanup", False):
+                for cleanup_layer_idx in result["layer_results"]:
+                    self._pending_residency_cleanup[cleanup_layer_idx] = True
+        return True
+
+    def _wait_prefetch(self, layer_idx: int) -> None:
+        """等待指定层上一轮异步预取完成。
+
+        只在“下一次同层真正要消费 KV”时等待，而不是在提交预取后立刻等待。
+        这就是 offload 版本 overlap 的关键：主线程可以先继续算后续层。
+        """
+        self._consume_prefetch(layer_idx, wait=True)
+
+    def _lease_missing_decode_rows(self, layer_idx: int) -> bool:
+        """当前 lease 是否缺少本步 decode 的 row。"""
+        lease = self._lease_hot_positions[layer_idx]
+        return lease is None or any(row not in lease for row in self._decode_rows.tolist())
+
+    def _lease_age_reached(self, layer_idx: int, steps: int) -> bool:
+        """当前 lease 是否已被任一 row 复用到指定步数。"""
+        starts = self._lease_start_positions[layer_idx]
+        for row_idx, cur_pos in zip(self._decode_rows.tolist(), self._decode_current_positions.tolist()):
+            if cur_pos - starts[row_idx] + 1 >= steps:
+                return True
+        return False
+
+    def should_collect_decode_attn_score(self, layer_idx: int) -> bool:
+        """是否本步在该层收集 attention score 以触发新一轮预测。
+
+        时序约束：本方法由 SparseController.prepare_forward() 在每个 decode step
+        开头一次性遍历所有层调用，副作用 self._collect_decode_positions[layer_idx]
+        会在该层真正 forward 时被 build_decode_view() 读取。判断里用到的
+        self._prefetch_futures[layer_idx] 是 step 开头的快照——这要求 source layer
+        的 future 在一个 step 内不会中途被清空。当前成立：future 只在上一 step 末尾
+        提交、本 step 该层 get_layer_store_view() 才消费，prepare_forward 阶段不消费。
+        若以后改动消费时机，需重新核对这里的一致性。
+        """
+        collect = False
+        if not self._is_layer_reuse_source(layer_idx):
+            self._collect_decode_positions[layer_idx] = collect
+            return collect
+        # future 仍在 -> 上一轮预测尚未消费，本步继续复用旧 lease，不重复收集。
+        if self._prefetch_futures[layer_idx] is None and not self._lease_missing_decode_rows(layer_idx):
+            collect = self._lease_age_reached(layer_idx, self._reuse_steps)
+        self._collect_decode_positions[layer_idx] = collect
+        return collect
+
+    def decode_attn_score_max_len(self, layer_idx: int, context_lens: torch.Tensor) -> int:
+        """decode 只需为 packed sparse view 分配 score buffer。"""
+        middle_budget = max(0, int(self.topk) - int(self.sink_token) - int(self.local_token))
+        block_budget = middle_budget // max(1, int(self.pooling_block_size))
+        keep_bound = int(self.sink_token) + int(self.local_token) + block_budget * int(self.pooling_block_size)
+        return max(1, keep_bound)
+
+    def decode_view_max_len(self, layer_idx: int, context_lens: torch.Tensor) -> int:
+        """build_decode_view 已在 CPU 侧算出 max_keep，避免每层 .item() 同步。"""
+        return self._decode_view_max_lens[layer_idx]
+
+    def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """返回当前层写入 K/V 的目标 cache 和 slot_mapping。
+
+        这是 offload decode 的“按层消费点”：
+        - prefill：所有 token 已经在 _prepare_prefill 中分配好 GPU slots，直接返回。
+        - decode：到达某一层时，才等待该层上一轮 prefetch；然后直接消费
+          predictor 已保存的下一步 positions；最后给当前新 token 分配本层 GPU slot。
+        """
+        ctx = get_context()
+        if not ctx.is_prefill:
+            if self.is_full_attention_layer(layer_idx):
+                rows = self._decode_rows
+                positions = self._decode_current_positions
+                current_slots = self._ensure_current_decode_slots(
+                    layer_idx, rows, positions
+                )
+                state = self.layer_batch_states[layer_idx]
+                state.slot_mapping = torch.tensor(
+                    current_slots, dtype=torch.int32, device="cuda"
+                )
+                positions_gpu = torch.as_tensor(
+                    positions, dtype=torch.long, device=state.slot_mapping.device
+                )
+                self.buffer_req_to_token_slots[layer_idx][
+                    state.req_indices.to(torch.long), positions_gpu
+                ] = state.slot_mapping
+                self._decode_view_max_lens[layer_idx] = int(
+                    self.row_seq_lens[rows].max()
+                )
+                k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+                return k_cache, v_cache, state.slot_mapping
+
+            # 若新 lease 还没好，继续用旧 lease；没有旧 lease 时必须等待初始化完成。
+            force_wait = self._lease_missing_decode_rows(layer_idx) or (
+                self._prefetch_futures[layer_idx] is not None
+                and self._lease_age_reached(layer_idx, self._max_stale_steps)
+            )
+            self._consume_prefetch(layer_idx, wait=force_wait) #预测步后，lease刷新，需要像复用层组提交新的lease
+            lease_hot_positions = self._lease_hot_positions[layer_idx]
+
+            state = self.layer_batch_states[layer_idx]
+
+            rows = self._decode_rows
+            current_positions = self._decode_current_positions
+
+            # 普通复用步不扫全量 residency；切到新 lease 后，各层到达自身写入点时清理旧 resident。
+            if self._pending_residency_cleanup[layer_idx]:
+                if self._residency_policy == "lease-aware":
+                    lease_hot_blocks = self._lease_hot_blocks[layer_idx]
+                    self._ensure_lease_blocks_resident(
+                        layer_idx,
+                        {row_idx: lease_hot_blocks[row_idx] for row_idx in rows.tolist()},
+                        stream=None,
+                    )
+                else:
+                    with profiler.record("attnpredict_offload_compose_decode_positions"):
+                        resident_positions: dict[int, np.ndarray] = {}
+                        for row_idx in rows.tolist():
+                            positions = self._compose_positions_from_hot(
+                                lease_hot_positions[row_idx],
+                                self.row_seq_lens[row_idx],
+                            )
+                            resident_positions[row_idx] = positions[:-1]
+                    self._ensure_positions_resident(
+                        layer_idx, resident_positions, stream=None
+                    )
+                self._pending_residency_cleanup[layer_idx] = False
+
+            # current KV 尚未写入 CPU backing，先处理历史驻留，再为 current 分配 GPU slot。
+            current_slots = self._ensure_current_decode_slots(layer_idx, rows, current_positions)
+            state.slot_mapping = torch.tensor(current_slots, dtype=torch.int32, device="cuda")
+
+        k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+        return k_cache, v_cache, self.layer_batch_states[layer_idx].slot_mapping
+
+    def _ensure_current_decode_slots(
+        self,
+        layer_idx: int,
+        rows: np.ndarray,
+        positions: np.ndarray,
+    ) -> list[int]:
+        """确保当前 decode token 在本层有 GPU active slot。
+
+        decode 新 token 是逐层写入的：同一个 token 在每一层的 K/V 不同，
+        因此每层走到 attention 前，才为该层分配 GPU slot 并写入当前 K/V。
+        """
+        with profiler.record("attnpredict_offload_ensure_current_slots"):
+            mirror = self.gpu_req_to_token_slots_cpu[layer_idx]
+            result: list[int] = []
+            with self._layer_locks[layer_idx]:
+                resident_rows = self._resident_positions[layer_idx]
+                active_rows = self._active_positions[layer_idx]
+                for row_idx, pos in zip(rows.tolist(), positions.tolist()):
+                    slot = mirror[row_idx, pos]
+                    if slot < 0:
+                        slot = self._allocate_gpu_slots_locked(layer_idx, 1)[0]
+                        mirror[row_idx, pos] = slot
+                    resident_rows.setdefault(row_idx, set()).add(pos)
+                    if self.is_full_attention_layer(layer_idx):
+                        result.append(slot)
+                        continue
+                    if self._residency_policy == "lease-aware":
+                        self._lease_active_blocks[layer_idx].setdefault(
+                            row_idx, set()
+                        ).add(pos // int(self.pooling_block_size))
+                    else:
+                        active_rows.setdefault(row_idx, set()).add(pos)
+                    result.append(slot)
+            # decode kernel 使用 packed slots，不再读全局 GPU row/pos map。
+            return result
+
+    def on_kv_stored(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        v: torch.Tensor | None = None,
+    ) -> None:
+        """Prefill 异步写入 CPU；decode 仅标记新 KV 为脏。"""
+        if not get_context().is_prefill:
+            if self.is_full_attention_layer(layer_idx):
+                return
+            with self._layer_locks[layer_idx]:
+                dirty = self._dirty_gpu_positions[layer_idx]
+                for row_idx, pos in zip(
+                    self._decode_rows.tolist(),
+                    self._decode_current_positions.tolist(),
+                ):
+                    dirty.add((row_idx, pos))
+                    cpu_slot = int(self.cpu_req_to_token_slots[row_idx, pos])
+                    self._cpu_backed_valid[layer_idx, cpu_slot] = False
+            return
+
+        # 完整注意力层的 KV 始终驻留 GPU，不需要额外写回 CPU。
+        if self.is_full_attention_layer(layer_idx):
+            return
+
+        cpu_slots = self._layer_cpu_slot_mapping[layer_idx]
+        if cpu_slots is None or v is None:
+            raise RuntimeError("Prefill 缺少 CPU 写回输入")
+        self._pending_prefill_writebacks[layer_idx] = (
+            k.detach(),
+            v.detach(),
+            np.asarray(cpu_slots, dtype=np.int64).copy(),
+        )
+
+    @torch.no_grad()
+    def prepare_prefill_predictor_inputs(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+        prefill_is_last_chunk: list[bool] | None = None,
+    ) -> torch.Tensor | None:
+        """Prefill 最后一块chunk 的 predictor 初始化。
+
+        返回一个 4D tail-score buffer 给 prefill kernel 填写：
+            [batch, num_heads, history_step, ceil(max_context_len / block_size)]
+
+        on_prefill_layer_end() 会在 attention kernel 完成后消费这个 buffer，
+        同步或异步初始化首个 decode 所需的 predictor mask。
+        """
+        if not self._is_layer_reuse_source(layer_idx):
+            self._pending_prefill_views[layer_idx] = None
+            return None
+        if prefill_is_last_chunk is None:
+            self._pending_prefill_views[layer_idx] = None
+            return None
+        last_batch_indices = [i for i, is_last in enumerate(prefill_is_last_chunk) if bool(is_last)]
+        if not last_batch_indices:
+            self._pending_prefill_views[layer_idx] = None
+            return None
+
+        view = self._make_prefill_tail_score_view(
+            q=q,
+            req_indices=req_indices,
+            context_lens=context_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            num_heads=num_heads,
+            last_batch_indices=last_batch_indices,
+        )
+        if view is None:
+            self._pending_prefill_views[layer_idx] = None
+            return None
+
+        self._pending_prefill_views[layer_idx] = view
+        return view["tail_score"]
+
+    def prefill_attn_score_block_size(self, layer_idx: int) -> int | None:
+        """offload 的 prefill tail-score 按 pooling block 写出，避免 token 级大缓冲。"""
+        return self.pooling_block_size
+
+    def prefill_attn_score_use_block_logits(self, layer_idx: int) -> bool:
+        return self.prefill_uses_block_logits
+
+    def _make_prefill_tail_score_view(
+        self,
+        *,
+        q: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None,
+        num_heads: int,
+        last_batch_indices: list[int],
+    ) -> dict[str, object] | None:
+        if cu_seqlens_q is None or cu_seqlens_q.numel() <= 1:
+            return None
+
+        batch_size = req_indices.numel()
+        history = self.history_step
+        max_len = context_lens.max().item()
+        block_size = self.pooling_block_size
+        if block_size <= 0:
+            raise ValueError("attnpredict_pooling_block_size must be > 0")
+        pooled_len = (max_len + block_size - 1) // block_size
+        fill_value = float("-inf") if self.prefill_uses_block_logits else 0.0
+        tail_score = torch.full(
+            (batch_size, num_heads, history, pooled_len),
+            fill_value,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        return {
+            "tail_score": tail_score,
+            "req_indices": req_indices.detach().to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=True),
+            "context_lens": context_lens.detach().to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=True),
+            "cu_seqlens_q": cu_seqlens_q.detach().to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=True),
+            "last_batch_indices": last_batch_indices,
+            "num_heads": num_heads,
+            "block_size": block_size,
+            "pooled_len": pooled_len,
+        }
+
+    def _predict_prefill_positions(
+        self,
+        layer_idx: int,
+        view: dict[str, object],
+    ) -> dict[int, np.ndarray]:
+        tail_score = view["tail_score"]
+        req_indices = view["req_indices"]
+        context_lens = view["context_lens"]
+        cu_seqlens_q = view["cu_seqlens_q"]
+        last_batch_indices = view["last_batch_indices"]
+        block_size = view["block_size"]
+        pooled_len = view["pooled_len"]
+
+        row_positions: dict[int, np.ndarray] = {}
+        for b in last_batch_indices:
+            row_idx = int(req_indices[b])
+            q_end = cu_seqlens_q[b + 1]
+            q_start = cu_seqlens_q[b]
+            q_len = q_end - q_start
+            full_len = context_lens[b]
+            if q_len <= 0 or full_len <= 0:
+                continue
+
+            take = min(self.history_step, q_len)
+            active_pooled_len = min(
+                pooled_len,
+                (full_len + block_size - 1) // block_size,
+            )
+            attn_pooling = tail_score[b, :, :take, :active_pooled_len]
+            observed_blocks = tail_causal_observed_block_mask(
+                full_len=int(full_len),
+                history_rows=int(take),
+                num_blocks=int(active_pooled_len),
+                block_size=int(block_size),
+                device=attn_pooling.device,
+            )
+            if self.prefill_uses_block_logits:
+                attn_pooling = torch.softmax(attn_pooling, dim=-1)
+            scores, start_block = self._update_predictor_scores_from_pooled(
+                layer_idx,
+                row_idx,
+                attn_pooling,
+                observed_block_mask=observed_blocks,
+                step_position=full_len,
+            )
+            row_positions[row_idx] = self._select_row_hot_positions(
+                layer_idx,
+                row_idx,
+                scores,
+                seq_len=full_len,
+                start_block=start_block,
+            )
+        return row_positions
+
+    def build_decode_view(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """构造 decode kernel 需要读取的 packed GPU slots。
+
+        SparseController.get_read_view() 对预测式卸载方法返回的是完整映射表，
+        但真正 decode 前还需要把“本层本 batch 的可见 positions”压成二维 packed slots：
+            packed_slots[b, j] = 第 b 个请求第 j 个可见 token 的 GPU slot
+            view_lens[b]      = 第 b 个请求实际可见 token 数
+
+        local_req_indices 使用 [0, batch_size) 是因为 packed_slots 已经是局部 batch 表，
+        kernel 不再需要全局 row_idx 去查完整 mapping。
+        """
+        if self.is_full_attention_layer(layer_idx):
+            self._last_decode_view[layer_idx] = None
+            return active_slots, req_indices, context_lens
+
+        with profiler.record("attnpredict_offload_build_decode_view"):
+            batch_size = req_indices.numel()
+            rows = self._decode_rows
+            mirror = self.gpu_req_to_token_slots_cpu[layer_idx]
+            lease = self._lease_hot_positions[layer_idx]
+            starts = self._lease_start_positions[layer_idx]
+            static_cache = self._static_view_cache[layer_idx]
+
+            row_views: list[tuple[int, torch.Tensor, torch.Tensor | None, np.ndarray, int, int]] = []
+            keep_counts: list[int] = []
+            rows_cpu = rows.tolist()
+            full_lens: list[int] = []
+            need_positions = self._collect_decode_positions[layer_idx]
+            with self._layer_locks[layer_idx]:
+                for row_idx in rows_cpu:
+                    full_len = int(self.row_seq_lens[row_idx])
+                    full_lens.append(full_len)
+                    sink_end = min(self.sink_token, full_len)
+                    recent_start = max(sink_end, full_len - self.local_token)
+                    recent_len = full_len - recent_start
+                    recent_slots = mirror[row_idx, recent_start:full_len].astype(np.int32, copy=True)
+
+                    lease_start = starts[row_idx]
+                    cached = static_cache.get(row_idx)
+                    if cached is None or cached[0] != lease_start or (need_positions and cached[3] is None):
+                        static_positions = self._compose_static_positions_from_hot(lease[row_idx], full_len)# 只包含sink+hot
+                        static_slots = mirror[row_idx, static_positions].astype(np.int32, copy=True)
+                        static_slots_gpu = torch.as_tensor(static_slots, dtype=torch.int32, device=q.device)
+                        static_positions_gpu = (
+                            torch.as_tensor(
+                                static_positions.astype(np.int32, copy=False),
+                                dtype=torch.int32,
+                                device=q.device,
+                            )
+                            if need_positions
+                            else None
+                        )
+                        cached = (lease_start, int(static_slots.size), static_slots_gpu, static_positions_gpu)
+                        static_cache[row_idx] = cached
+                    _, static_len, static_slots_gpu, static_positions_gpu = cached
+                    row_views.append(
+                        (static_len, static_slots_gpu, static_positions_gpu, recent_slots, recent_start, recent_len)
+                    )
+                    keep_counts.append(static_len + recent_len)
+
+            max_keep = max(keep_counts)
+            self._decode_view_max_lens[layer_idx] = max_keep
+
+            packed_slots = self._get_packed_slots_buffer(layer_idx, batch_size, max_keep, q.device)
+            packed_positions = (
+                self._get_packed_positions_buffer(layer_idx, batch_size, max_keep, q.device)
+                if need_positions
+                else None
+            )
+            # 构造每个seq的 packed view：先是 lease 内稳定的部分（GPU 上已有），再拼上 recent 这部分
+            for b, (
+                static_len,
+                static_slots_gpu,
+                static_positions_gpu,
+                recent_slots,
+                recent_start,
+                recent_len,
+            ) in enumerate(row_views):
+                k = static_len + recent_len
+                packed_slots[b, :static_len].copy_(static_slots_gpu)
+                packed_slots[b, static_len:k] = torch.as_tensor(recent_slots, dtype=torch.int32, device=q.device)
+                if packed_positions is not None:
+                    packed_positions[b, :static_len].copy_(static_positions_gpu)
+                    packed_positions[b, static_len:k] = torch.arange(
+                        recent_start, recent_start + recent_len, dtype=torch.int32, device=q.device
+                    )
+
+            view_lens = torch.tensor(keep_counts, dtype=torch.int32, device=q.device)
+            local_req_indices = self._get_local_req_indices(batch_size, q.device)
+
+            # 保存本次 decode view，attention kernel 会把 logits 写到 attn_score；
+            # attention 结束后 predict_next_mask() 用这些元数据把 sparse logits 还原到 full positions。
+            self._last_decode_view[layer_idx] = (
+                {
+                    "positions": packed_positions.detach(),
+                    "req_indices_cpu": rows_cpu,
+                    "view_lens_cpu": keep_counts,
+                    "full_context_lens_cpu": full_lens,
+                }
+                if packed_positions is not None
+                else None
+            )
+            return packed_slots, local_req_indices, view_lens
+
+    def predict_next_mask(self, layer_idx: int, attn_logits: torch.Tensor) -> None:
+        """根据当前层刚算完的 attention logits，预测下一步 active set。
+
+        这个函数由 SparseController.on_attention_end() 调用。
+        它只记录当前 CUDA stream 上的 event，然后把真正的 softmax/CNN/CPU gather/H2D
+        放到后台线程和本层 prefetch stream 里执行。
+        """
+        view = self._last_decode_view[layer_idx]
+        # 记录 attention 所在主 stream 的完成事件。后台 prefetch stream 必须 wait 它，
+        # 才能安全读取 attn_logits。
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        view_copy = dict(view)
+        logits_ref = attn_logits.detach()
+        self._prefetch_futures[layer_idx] = self._prefetch_executor.submit(
+            self._predict_and_prefetch_worker,
+            layer_idx,
+            logits_ref,
+            view_copy,
+            event,
+        )
+
+    def on_prefill_layer_end(self, layer_idx: int) -> None:
+        """最后一个 prefill chunk 的 attention 完成后，准备首个 decode 的 active set。
+
+        prefill 本身保持 full attention，不做稀疏。只有最后一个 prefill chunk
+        才会在这里根据首个 decode mask 释放非 active GPU slots，并保留/预取
+        首个 decode 需要的 token。mask 初始化和 residency 更新都在后台 worker 里完成。
+        """
+        pending_writeback = self._pending_prefill_writebacks[layer_idx]
+        if pending_writeback is not None:
+            self._pending_prefill_writebacks[layer_idx] = None
+            k, v, cpu_slots = pending_writeback
+            self._enqueue_prefill_writeback(layer_idx, k, v, cpu_slots)
+
+        ctx = get_context()
+        if not ctx.prefill_is_last_chunk:
+            return
+
+        pending_view = self._pending_prefill_views[layer_idx]
+        if pending_view is None:
+            return
+        self._pending_prefill_views[layer_idx] = None
+        # 同一层已有后台任务时，先消费/完成旧任务，再提交新的 prefill 初始化任务。
+        self._wait_prefetch(layer_idx)
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream()) # 标记当前主 stream 的完成事件，后台 prefetch stream 必须 wait 它，才能安全读取 prefill tail_score。
+        self._prefetch_futures[layer_idx] = self._prefetch_executor.submit(
+            self._prefill_predict_and_prefetch_worker,
+            layer_idx,
+            pending_view,
+            event,
+        )
+
+    def _predict_and_prefetch_worker(
+        self,
+        layer_idx: int,
+        attn_logits: torch.Tensor,
+        view: dict[str, torch.Tensor | None],
+        attention_done_event: torch.cuda.Event,
+    ) -> dict[str, object]:
+        """后台任务：等待 attention 完成，预测下一步 mask，并预取下一步 KV。
+
+        返回一个 CUDA event。下一次同层 get_layer_store_view() 会等待这个 event，
+        确认本层 active pool 已经准备好。
+        """
+        torch.cuda.set_device(attn_logits.device)
+        stream = self._prefetch_stream
+        with torch.inference_mode(), torch.cuda.stream(stream):
+            # 必须等主 stream 的 attention kernel 写完 attn_logits。
+            stream.wait_event(attention_done_event)
+            with profiler.record("attnpredict_offload_predictor_stream"):
+                hot_positions = self._predict_next_positions(
+                    layer_idx, attn_logits, view
+                )
+            lease_starts = {
+                row: full_len
+                for row, full_len in zip(view["req_indices_cpu"], view["full_context_lens_cpu"])
+                if row in hot_positions
+            }
+
+        # residency 更新和 H2D 拷贝也挂在本层 prefetch stream 上。
+        layer_results = self._expand_layer_results(layer_idx, hot_positions, lease_starts)
+        self._prefetch_layer_results(layer_results, stream)
+        with torch.cuda.stream(stream):
+            done = torch.cuda.Event()
+            done.record(stream)
+        return {"event": done, "layer_results": layer_results, "needs_cleanup": True}
+
+    def _prefill_predict_and_prefetch_worker(
+        self,
+        layer_idx: int,
+        view: dict[str, object],
+        attention_done_event: torch.cuda.Event, #主 stream 的完成事件。后台 stream 必须先等这个 event，确保 prefill attention 已经写完 tail_score。
+    ) -> dict[str, object]:
+        """后台任务：prefill 最后一块结束后初始化 predictor，并准备首个 decode active set。"""
+        tail_score = view["tail_score"]
+        torch.cuda.set_device(tail_score.device)
+        stream = self._prefetch_stream
+        with torch.inference_mode(), torch.cuda.stream(stream):
+            stream.wait_event(attention_done_event)
+            with profiler.record("attnpredict_offload_prefill_predict_stream"):
+                hot_positions = self._predict_prefill_positions(layer_idx, view)
+            lease_starts = {
+                row: full_len
+                for row, full_len in zip(
+                    view["req_indices"].tolist(),
+                    view["context_lens"].tolist(),
+                )
+                if row in hot_positions
+            }
+
+        layer_results = self._expand_layer_results(layer_idx, hot_positions, lease_starts)
+        # 后续层尚未执行当前 prefill chunk，源层后台任务不能提前收缩它们。
+        # 首次 decode 写入时再提交 Lease 并逐层清理。
+        with torch.cuda.stream(stream):
+            done = torch.cuda.Event()# 在 stream 当前队列的末尾放一个 event。
+            done.record(stream) # 这个 event 完成，就表示它前面已经排到这个 stream 上的任务都完成了。
+        return {"event": done, "layer_results": layer_results, "needs_cleanup": True}
+
+    def _predict_next_positions(
+        self,
+        layer_idx: int,
+        attn_logits: torch.Tensor,
+        view: dict[str, torch.Tensor | None],
+    ) -> dict[int, np.ndarray]:
+        """执行 AttentionPredictor 的“logits -> 下一步 positions”逻辑。
+
+        输入 attn_logits 是当前 decode attention kernel 写出的 sparse view logits。
+        如果当前层只看了部分 token，logits 的最后一维只覆盖 packed view。
+        这里直接按 packed positions 做 block pooling，避免构造 [heads, full_len]。
+        """
+        with profiler.record("attnpredict_offload_predict_next_positions"):
+            positions = view["positions"]
+            req_indices_cpu = view["req_indices_cpu"]
+            view_lens_cpu = view["view_lens_cpu"]
+            full_context_lens_cpu = view["full_context_lens_cpu"]
+
+            row_positions: dict[int, np.ndarray] = {}
+            for b, row_idx in enumerate(req_indices_cpu):
+                # req_indices_cpu 是 cache manager 的全局 row；view_lens_cpu 是本次实际可见 token 数；
+                # full_len 是当前序列完整逻辑长度。
+                view_len = int(view_lens_cpu[b])
+                full_len = int(full_context_lens_cpu[b])
+
+                # attn_logits 是未 scale 的 raw logits；这里和原 attnpredict 一样乘 attn_scale 后 softmax。
+                with profiler.record("attnpredict_offload_softmax"):
+                    logits = attn_logits[b, :, :view_len].to(torch.float32)
+                    attn = torch.softmax(logits * self.attn_scale, dim=-1)
+                pos = positions[b, :view_len].to(device=attn.device, dtype=torch.long)
+                pooled_len = (full_len + self.pooling_block_size - 1) // self.pooling_block_size
+                block_idx = pos // self.pooling_block_size
+                with profiler.record("attnpredict_offload_scatter_reduce"):
+                    attn_pooling = torch.zeros(
+                        (attn.shape[0], pooled_len),
+                        dtype=attn.dtype,
+                        device=attn.device,
+                    )
+                    attn_pooling.scatter_reduce_(
+                        1,
+                        block_idx.unsqueeze(0).expand(attn.shape[0], -1),
+                        attn,
+                        reduce="amax",
+                        include_self=True,
+                    )
+                    observed_blocks = torch.zeros(
+                        pooled_len, dtype=torch.bool, device=attn.device
+                    )
+                    observed_blocks[block_idx] = True
+
+                with profiler.record("attnpredict_offload_update_predictor"):
+                    tsp_attn, start_block = self._update_predictor_scores_from_pooled(
+                        layer_idx,
+                        row_idx,
+                        attn_pooling.unsqueeze(1),
+                        observed_block_mask=observed_blocks,
+                        step_position=full_len,
+                    )
+                with profiler.record("attnpredict_offload_topk"):
+                    row_positions[row_idx] = self._select_row_hot_positions(
+                        layer_idx,
+                        row_idx,
+                        tsp_attn,
+                        seq_len=full_len,
+                        start_block=start_block,
+                    )
+            return row_positions
+
+    def _prepare_prefill(self, seqs: list[Sequence]):
+        """准备 prefill 输入，并为本 chunk 所有 token 分配 GPU/CPU slots。
+
+        offload 的 prefill 策略是 full attention：
+        - 当前 chunk 的所有 token 都分配 GPU active slots。
+        - 同一批 token 也分配 CPU full backing slots。
+        - context_lens 是每个序列 prefill 到当前 chunk 后的完整长度。
+
+        这样多 chunk prefill 时，每个 chunk 都能看到“已有历史 + 当前 chunk”的完整 KV。
+        真正的 GPU active 裁剪只发生在最后一个 prefill chunk 的 attention 结束后。
+        """
+        with profiler.record("cache_prepare_prefill"):
+            total_chunk_tokens = sum(seq.current_chunk_size for seq in seqs)
+
+            # 模型 forward 的扁平输入。多个序列的 chunk 会拼成一个 1D token 列表。
+            input_ids_np = np.empty(total_chunk_tokens, dtype=np.int64)
+            positions_np = np.empty(total_chunk_tokens, dtype=np.int64)
+            cu_seqlens_q = [0]
+
+            # 每层物理 slot 独立；先在 CPU 汇总，再用一次 H2D 提交本 chunk 的映射。
+            layers_slot_mapping_np = np.empty(
+                (self.num_layers, total_chunk_tokens), dtype=np.int32
+            )
+            context_lens_list: list[int] = []
+            mapping_ranges: list[tuple[int, int, int, int, int]] = []
+
+            # CPU slot_mapping 对所有层相同：同一个 token 的 CPU slot 在每层 CPU cache 中
+            # 存该层对应 K/V。
+            # CPU index_copy_ 使用 int64/long 索引。
+            cpu_slot_mapping = np.empty((total_chunk_tokens,), dtype=np.int64)
+            token_offset = 0
+            for seq in seqs:
+                chunk_size = seq.current_chunk_size
+                start_idx = seq.num_prefilled_tokens
+                end_idx = start_idx + chunk_size
+                row_idx = self._get_free_row(seq.seq_id)
+
+                # 如果该序列是 chunked prefill 的后续 chunk，row_seq_lens 必须刚好等于
+                # 已经 prefill 的 token 数，否则说明调度/释放账本出错。
+                if self.row_seq_lens[row_idx] != start_idx:
+                    raise ValueError(
+                        "AttnPredict offload row length mismatch in prefill: "
+                        f"seq_id={seq.seq_id} row_seq_len={self.row_seq_lens[row_idx]} start_idx={start_idx}"
+                    )
+
+                # 先给完整历史 backing 分配 CPU slots。row_seq_lens 会在这里增长。
+                cpu_slots = self._allocate_cpu_slots(seq.seq_id, chunk_size)
+                cpu_slot_mapping[token_offset:token_offset + chunk_size] = cpu_slots
+                for layer_id in range(self.num_layers):
+                    # 每一层都要给当前 chunk 分配 GPU slots，保证 prefill full attention。
+                    with self._layer_locks[layer_id]:
+                        gpu_slots = self._allocate_gpu_slots_locked(layer_id, chunk_size)
+                        self.gpu_req_to_token_slots_cpu[layer_id][row_idx, start_idx:end_idx] = gpu_slots
+
+                    layers_slot_mapping_np[
+                        layer_id, token_offset:token_offset + chunk_size
+                    ] = gpu_slots
+
+                context_lens_list.append(end_idx)
+                mapping_ranges.append(
+                    (row_idx, start_idx, end_idx, token_offset, token_offset + chunk_size)
+                )
+
+                chunk_tokens = seq.token_ids
+                if len(chunk_tokens) > chunk_size:
+                    chunk_tokens = chunk_tokens[start_idx:end_idx]
+                input_ids_np[token_offset:token_offset + chunk_size] = chunk_tokens
+                positions_np[token_offset:token_offset + chunk_size] = np.arange(start_idx, end_idx)
+
+                # cu_seqlens_q 用于 prefill attention kernel 区分每个序列 chunk 的边界。
+                cu_seqlens_q.append(cu_seqlens_q[-1] + chunk_size)
+                token_offset += chunk_size
+
+            layers_slot_mapping_cuda = torch.from_numpy(layers_slot_mapping_np).to("cuda")
+            for layer_id in range(self.num_layers):
+                layer_mapping = self.buffer_req_to_token_slots[layer_id]
+                for row_idx, start_idx, end_idx, token_start, token_end in mapping_ranges:
+                    layer_mapping[row_idx, start_idx:end_idx].copy_(
+                        layers_slot_mapping_cuda[layer_id, token_start:token_end]
+                    )
+
+            # 写入每层 LayerBatchStates。attention.py 会按 now_layer_idx 取当前层状态。
+            context_lens_cuda = torch.tensor(context_lens_list, dtype=torch.int32, device="cuda")
+            req_ids = [self.seq_id_to_row[seq.seq_id] for seq in seqs]
+            req_ids_cuda = torch.tensor(req_ids, dtype=torch.int32, device="cuda")
+            for layer_id in range(self.num_layers):
+                state = self.layer_batch_states[layer_id]
+                state.slot_mapping = layers_slot_mapping_cuda[layer_id]
+                state.context_lens = context_lens_cuda
+                state.req_indices = req_ids_cuda
+                # on_kv_stored() 按当前 layer 取映射，内容跨层相同。
+                self._layer_cpu_slot_mapping[layer_id] = cpu_slot_mapping
+            input_ids = torch.from_numpy(input_ids_np).to("cuda")
+            positions = torch.from_numpy(positions_np).to("cuda")
+            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device="cuda")
+            return input_ids, positions, cu_seqlens_q
+
+    def _prepare_decode(self, seqs: list[Sequence]):
+        """准备 decode 输入，并只分配 CPU full backing slot。
+
+        decode 新 token 的 GPU slot 不在这里一次性为所有层分配，而是在
+        get_layer_store_view(layer) 中逐层分配。这样每层可以先消费自己的
+        prefetch 结果，再写入当前层的新 KV。
+        """
+        # 首次 decode 前必须保证所有 prompt block 已有有效 CPU 后备副本。
+        with profiler.record("attnpredict_offload_prefill_writeback_barrier"):
+            self._wait_prefill_writebacks()
+        with profiler.record("cache_prepare_decode"):
+            batch_size = len(seqs)
+            input_ids_list = [seq.last_token for seq in seqs]
+            positions_list = [seq.num_tokens - 1 for seq in seqs]
+            cpu_slots_batch = np.empty((batch_size,), dtype=np.int64)
+            rows = np.empty((batch_size,), dtype=np.int64)
+            current_positions = np.empty((batch_size,), dtype=np.int64)
+
+            for b, seq in enumerate(seqs):
+                row_idx = self._get_free_row(seq.seq_id)
+
+                # 当前 token 的逻辑位置就是 CPU backing 分配前的 row_seq_lens。
+                current_positions[b] = self.row_seq_lens[row_idx]
+                cpu_slots_batch[b] = self._allocate_cpu_slots(seq.seq_id, 1)[0]
+                rows[b] = row_idx
+
+            # _allocate_cpu_slots 后 row_seq_lens 已经 +1，所以 context_lens 包含当前 token。
+            context_lens_np = self.row_seq_lens[rows]
+            context_lens_cuda = torch.tensor(context_lens_np, dtype=torch.int32, device="cuda")
+            req_indices_cuda = torch.tensor(rows, dtype=torch.int32, device="cuda")
+
+            # decode 当前 token 的 GPU slot 逐层分配，所以 prepare 阶段先放 -1 占位。
+            empty_slot_mapping = torch.full((batch_size,), -1, dtype=torch.int32, device="cuda")
+
+            for layer_id in range(self.num_layers):
+                state = self.layer_batch_states[layer_id]
+                state.slot_mapping = empty_slot_mapping
+                state.context_lens = context_lens_cuda
+                state.req_indices = req_indices_cuda
+                self._layer_cpu_slot_mapping[layer_id] = cpu_slots_batch
+
+            # 后续每层 get_layer_store_view() 需要这两个数组来构建 base/current positions。
+            self._decode_rows = rows
+            self._decode_current_positions = current_positions
+
+            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
+            positions = torch.tensor(positions_list, dtype=torch.int64, device="cuda")
+            return input_ids, positions, None
+
+    def free_seq(self, seq_id: int):
+        """释放某个序列占用的 GPU active slots、CPU full slots 和 predictor 状态。"""
+        # 后台写回结束前不能回收 CPU 槽。
+        self._wait_prefill_writebacks()
+        self._wait_dirty_writebacks()
+        row_idx = self.seq_id_to_row.pop(seq_id)
+        # 先把所有层的后台任务全部消费完，再统一清理。两阶段分开的原因：
+        # _wait_prefetch 消费 source layer 的 future 时，_commit_layer_results 会
+        # 把跨层结果提交到整个复用组（含尚未清理的层），其 _commit_lease 会向正在
+        # 释放的 row 写回 lease。若边等边清，后等到的 commit 会复活已清理层的 row。
+        for layer_idx in range(self.num_layers):
+            self._wait_prefetch(layer_idx)
+        for layer_idx in range(self.num_layers):
+            lease_hot_positions = self._lease_hot_positions[layer_idx]
+            if lease_hot_positions is not None:
+                lease_hot_positions.pop(row_idx, None)
+            lease_hot_blocks = self._lease_hot_blocks[layer_idx]
+            if lease_hot_blocks is not None:
+                lease_hot_blocks.pop(row_idx, None)
+            self._lease_start_positions[layer_idx].pop(row_idx, None)
+            with self._layer_locks[layer_idx]:
+                # 镜像表是权威来源，批量筛选物理槽，避免构造超长 Python 集合。
+                self._resident_positions[layer_idx].pop(row_idx, None)
+                full_len = self.row_seq_lens[row_idx]
+                row_slots = self.gpu_req_to_token_slots_cpu[layer_idx][
+                    row_idx, :full_len
+                ]
+                slots = row_slots[row_slots >= 0].astype(np.int32, copy=False)
+                if slots.size:
+                    self.free_slots_stack[layer_idx].extend(slots.tolist())
+                    self._num_free_slots[layer_idx] += int(slots.size)
+                self.gpu_req_to_token_slots_cpu[layer_idx][row_idx, :] = -1
+                self.buffer_req_to_token_slots[layer_idx][row_idx, :] = -1
+                dirty = self._dirty_gpu_positions[layer_idx]
+                dirty.difference_update({key for key in dirty if key[0] == row_idx})
+                self._active_positions[layer_idx].pop(row_idx, None)
+                self._lease_active_blocks[layer_idx].pop(row_idx, None)
+                self._lease_grace_blocks[layer_idx].pop(row_idx, None)
+                self._static_view_cache[layer_idx].pop(row_idx, None)
+
+        self._free_predictor_row(row_idx)
+
+        # 回收 CPU full backing slots。CPU slot 是跨层共享 token slot，
+        # 所以只需要按 row/pos 回收一次。
+        full_len = self.row_seq_lens[row_idx]
+        cpu_slots = self.cpu_req_to_token_slots[row_idx, :full_len]
+        cpu_slots = cpu_slots[cpu_slots >= 0]
+        if cpu_slots.size:
+            self._cpu_backed_valid[:, cpu_slots] = False
+            self.cpu_free_slots_stack.extend(cpu_slots.tolist())
+            self._num_free_cpu_slots += cpu_slots.size
+        self.cpu_req_to_token_slots[row_idx, :] = -1
+        self.row_seq_lens[row_idx] = 0
+        self.free_rows.append(row_idx)
+
+    def free_part_slots(
+        self,
+        layer_idx: int,
+        seq: Sequence,
+        keep_indices: torch.Tensor,
+    ) -> None:
+        """预测式卸载通过 Lease 管理驻留，不接受控制器的局部驱逐。"""
+        raise NotImplementedError

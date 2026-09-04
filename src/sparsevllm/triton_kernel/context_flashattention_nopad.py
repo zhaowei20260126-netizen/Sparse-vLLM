@@ -309,6 +309,7 @@ def _fwd_kernel_with_tail_score(
     stride_asb, stride_ash, stride_ast, stride_asl,
     kv_group_num, b_prompt_cache_len,
     HISTORY_STEP: tl.constexpr, TAIL_BLOCK_SIZE: tl.constexpr, TAIL_BLOCKS_PER_N: tl.constexpr,
+    TAIL_LOGITS_ONLY: tl.constexpr,
     H: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     start_m = tl.program_id(0)
@@ -339,6 +340,7 @@ def _fwd_kernel_with_tail_score(
     block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
     block_end_loc = tl.minimum(block_start_loc + BLOCK_M + prompt_cache_len, cur_batch_seq_len + prompt_cache_len)
     tail_start = tl.maximum(cur_batch_seq_len - HISTORY_STEP, 0)
+    tail_block_mask = tl.where(block_start_loc + BLOCK_M > tail_start, 1, 0)
     tail_idx = offs_m - tail_start
     tail_q_mask = (offs_m >= tail_start) & (offs_m < cur_batch_seq_len) & (tail_idx >= 0) & (tail_idx < HISTORY_STEP)
 
@@ -355,6 +357,25 @@ def _fwd_kernel_with_tail_score(
 
         mask = (offs_m[:, None] + prompt_cache_len) >= kv_pos[None, :]
 
+        if TAIL_LOGITS_ONLY:
+            block_logits = tl.where(mask, qk * sm_scale * 0.6931471805599453, -1.0e20)
+            for block_group in tl.static_range(0, TAIL_BLOCKS_PER_N):
+                block_start = start_n + block_group * TAIL_BLOCK_SIZE
+                block_idx = block_start // TAIL_BLOCK_SIZE
+                in_block = (kv_pos >= block_start) & (kv_pos < block_start + TAIL_BLOCK_SIZE)
+                block_score = tl.max(tl.where(in_block[None, :], block_logits, -1.0e20), 1)
+                score_offsets = (
+                    cur_batch * stride_asb
+                    + cur_head * stride_ash
+                    + tail_idx * stride_ast
+                    + block_idx * stride_asl
+                )
+                tl.store(
+                    Attn_Score + score_offsets,
+                    block_score,
+                    mask=tail_q_mask & (block_start < block_end_loc),
+                )
+
         qk = tl.where(mask, qk * sm_scale, -1.0e8)
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -369,40 +390,41 @@ def _fwd_kernel_with_tail_score(
         acc = tl.dot(p.to(v.dtype), v, acc)
         m_i = m_ij
 
-    # 只写 block 级 tail-score：等价于 softmax(token logits) 后按 pooling block 做 max。
-    for start_n in range(0, block_mask * block_end_loc, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        kv_pos = start_n + offs_n
-        kv_loc = tl.load(
-            Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * kv_pos,
-            mask=kv_pos < block_end_loc, other=0,
-        )
-        off_k = kv_loc[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
-        k = tl.load(K + off_k, mask=kv_pos[None, :] < block_end_loc, other=0.0)
-        qk = tl.dot(q, k)
-
-        mask = (offs_m[:, None] + prompt_cache_len) >= kv_pos[None, :]
-        valid = mask & (kv_pos[None, :] < block_end_loc)
-        qk = tl.where(valid, qk * sm_scale, -1.0e20)
-        prob = tl.math.exp2(qk - m_i[:, None]) / l_i[:, None]
-        prob = tl.where(valid, prob, 0.0)
-
-        for block_group in tl.static_range(0, TAIL_BLOCKS_PER_N):
-            block_start = start_n + block_group * TAIL_BLOCK_SIZE
-            block_idx = block_start // TAIL_BLOCK_SIZE
-            in_block = (kv_pos >= block_start) & (kv_pos < block_start + TAIL_BLOCK_SIZE)
-            block_score = tl.max(tl.where(in_block[None, :], prob, 0.0), 1)
-            score_offsets = (
-                cur_batch * stride_asb
-                + cur_head * stride_ash
-                + tail_idx * stride_ast
-                + block_idx * stride_asl
+    if not TAIL_LOGITS_ONLY:
+        # Only the one or two query tiles overlapping the history tail emit scores.
+        for start_n in range(0, block_mask * tail_block_mask * block_end_loc, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            kv_pos = start_n + offs_n
+            kv_loc = tl.load(
+                Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * kv_pos,
+                mask=kv_pos < block_end_loc, other=0,
             )
-            tl.store(
-                Attn_Score + score_offsets,
-                block_score,
-                mask=tail_q_mask & (block_start < block_end_loc),
-            )
+            off_k = kv_loc[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
+            k = tl.load(K + off_k, mask=kv_pos[None, :] < block_end_loc, other=0.0)
+            qk = tl.dot(q, k)
+
+            mask = (offs_m[:, None] + prompt_cache_len) >= kv_pos[None, :]
+            valid = mask & (kv_pos[None, :] < block_end_loc)
+            qk = tl.where(valid, qk * sm_scale, -1.0e20)
+            prob = tl.math.exp2(qk - m_i[:, None]) / l_i[:, None]
+            prob = tl.where(valid, prob, 0.0)
+
+            for block_group in tl.static_range(0, TAIL_BLOCKS_PER_N):
+                block_start = start_n + block_group * TAIL_BLOCK_SIZE
+                block_idx = block_start // TAIL_BLOCK_SIZE
+                in_block = (kv_pos >= block_start) & (kv_pos < block_start + TAIL_BLOCK_SIZE)
+                block_score = tl.max(tl.where(in_block[None, :], prob, 0.0), 1)
+                score_offsets = (
+                    cur_batch * stride_asb
+                    + cur_head * stride_ash
+                    + tail_idx * stride_ast
+                    + block_idx * stride_asl
+                )
+                tl.store(
+                    Attn_Score + score_offsets,
+                    block_score,
+                    mask=tail_q_mask & (block_start < block_end_loc),
+                )
 
     acc = acc / l_i[:, None]
     off_o = (
@@ -522,6 +544,7 @@ def context_attention_fwd(
     q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, req_to_token_indexs,
     attn_score=None,
     attn_score_block_size=None,
+    attn_score_use_block_logits=False,
 ):
     # --- 第1步: 确定分块大小 ---
     # Tesla 老卡 (T4/V100) SRAM 较小，用更小的 BLOCK_M 避免溢出
@@ -621,6 +644,7 @@ def context_attention_fwd(
             HISTORY_STEP=attn_score.shape[2],
             TAIL_BLOCK_SIZE=attn_score_block_size,
             TAIL_BLOCKS_PER_N=BLOCK_N // attn_score_block_size,
+            TAIL_LOGITS_ONLY=bool(attn_score_use_block_logits),
             H=head, BLOCK_DMODEL=Lk, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
             num_warps=num_warps, num_stages=num_stages,
         )
